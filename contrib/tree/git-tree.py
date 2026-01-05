@@ -5,7 +5,9 @@
 Print the basic file-history tree (touch-commit graph) to stdout.
 
 Git-like CLI:
-  python git-tree.py [-C <path>] [--max-commits N] [--include-remotes] -- <pathspec...>
+  python git-tree.py [-C <path>] [--max-commits N] [--include-remotes]
+                     [--show-files] [--name-status] [--max-files N]
+                     -- <pathspec...>
 
 Notes:
 - No --repo. Use -C like git; default is current directory.
@@ -310,14 +312,69 @@ class FileHistoryGraphBuilder:
             yield xs[i : i + n]
 
 
+# ------------------------- touched files provider -------------------------
+
+
+class CommitTouchedFiles:
+    """Optional per-commit touched-paths provider (cached)."""
+
+    def __init__(self, git: Git, pathspecs: List[str]) -> None:
+        self.git = git
+        self.pathspecs = pathspecs
+        self._cache_name_only: Dict[str, List[str]] = {}
+        self._cache_name_status: Dict[str, List[str]] = {}
+
+    def get(self, sha: str, *, name_status: bool) -> List[str]:
+        cache = self._cache_name_status if name_status else self._cache_name_only
+        if sha in cache:
+            return cache[sha]
+
+        args = [
+            "diff-tree",
+            "--root",
+            "-m",  # include merges (dedupe below)
+            "-r",
+            "--no-commit-id",
+            "--name-status" if name_status else "--name-only",
+            sha,
+            "--",
+            *self.pathspecs,
+        ]
+        out = self.git.run(args, timeout_s=120)
+
+        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+        # Dedupe while keeping order
+        seen: Set[str] = set()
+        uniq: List[str] = []
+        for ln in lines:
+            if ln not in seen:
+                seen.add(ln)
+                uniq.append(ln)
+
+        cache[sha] = uniq
+        return uniq
+
+
 # ------------------------- printer -------------------------
 
 
 class AsciiTreePrinter:
     """Print a rooted forest of commits using the compressed parent graph."""
 
-    def __init__(self, graph: FileHistoryGraph) -> None:
+    def __init__(
+        self,
+        graph: FileHistoryGraph,
+        *,
+        touched_files: Optional[CommitTouchedFiles] = None,
+        show_files: bool = False,
+        name_status: bool = False,
+        max_files: int = 0,
+    ) -> None:
         self.g = graph
+        self.touched_files = touched_files
+        self.show_files = show_files
+        self.name_status = name_status
+        self.max_files = max(0, int(max_files))
 
     def print(self) -> None:
         g = self.g
@@ -389,7 +446,6 @@ class AsciiTreePrinter:
 
     def _print_tree(self, roots: List[str], children_of: Dict[str, List[str]]) -> None:
         def walk(node: str, prefix: str, is_last: bool, path: Set[str]) -> None:
-            # Print this node
             connector = "└─ " if is_last else "├─ "
             line = self._format_commit_line(node)
             if prefix:
@@ -397,23 +453,33 @@ class AsciiTreePrinter:
             else:
                 print(line)
 
-            # Prevent cycles (shouldn't happen, but keep it)
             if node in path:
                 return
             path2 = set(path)
             path2.add(node)
 
-            # Prepare prefix for children: keep vertical bar if this node has next siblings
             child_prefix = prefix + ("    " if is_last else "│   ")
+
+            if self.show_files and self.touched_files is not None:
+                files = self.touched_files.get(node, name_status=self.name_status)
+                if self.max_files and len(files) > self.max_files:
+                    shown = files[: self.max_files]
+                    more = len(files) - self.max_files
+                else:
+                    shown = files
+                    more = 0
+
+                for f in shown:
+                    print(f"{child_prefix}· {f}")
+                if more:
+                    print(f"{child_prefix}· ... ({more} more)")
 
             kids = children_of.get(node, [])
             for i, k in enumerate(kids):
                 walk(k, child_prefix, i == len(kids) - 1, path2)
 
-        # Multiple roots: treat each root as a sibling, so the continuation bar shows correctly
         for i, r in enumerate(roots):
-            is_last_root = i == len(roots) - 1
-            walk(r, "" if is_last_root else "", is_last_root, set())
+            walk(r, prefix="", is_last=(i == len(roots) - 1), path=set())
 
 
 # ------------------------- OO CLI -------------------------
@@ -426,6 +492,9 @@ class GitTreeCli:
         C: str = ".",
         max_commits: int = 2000,
         include_remotes: bool = False,
+        show_files: bool = False,
+        name_status: bool = False,
+        max_files: int = 0,
         pathspec: Optional[List[str]] = None,
     ) -> None:
         if not pathspec:
@@ -435,7 +504,6 @@ class GitTreeCli:
         git = Git(cwd)
         toplevel = git.show_toplevel()
 
-        # Display only; avoid f-string backslash issue by precomputing.
         ps = [p.replace("\\", "/") for p in pathspec]
 
         graph = FileHistoryGraphBuilder(git).build(
@@ -444,13 +512,21 @@ class GitTreeCli:
             include_remotes=bool(include_remotes),
         )
 
+        touched = CommitTouchedFiles(git, ps) if show_files else None
+
         print(f"Repo: {toplevel}")
         print(f"Pathspec: {ps}")
         print(f"HEAD branch: {graph.head_branch}")
         print(f"Touch commits: {len(graph.touch_shas)}")
         print()
 
-        AsciiTreePrinter(graph).print()
+        AsciiTreePrinter(
+            graph,
+            touched_files=touched,
+            show_files=show_files,
+            name_status=name_status,
+            max_files=max_files,
+        ).print()
 
 
 # ------------------------- argparse -------------------------
@@ -461,6 +537,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("-C", dest="C", default=".", help="run as if started in <path>")
     ap.add_argument("--max-commits", type=int, default=2000)
     ap.add_argument("--include-remotes", action="store_true")
+    ap.add_argument("--show-files", action="store_true", help="print touched files under each commit")
+    ap.add_argument("--name-status", action="store_true", help="use name-status instead of name-only")
+    ap.add_argument("--max-files", type=int, default=0, help="cap printed files per commit (0=unlimited)")
     ap.add_argument("rest", nargs=argparse.REMAINDER, help="use: -- <pathspec...>")
     ns = ap.parse_args()
 
@@ -478,6 +557,9 @@ def main() -> None:
         C=ns.C,
         max_commits=ns.max_commits,
         include_remotes=ns.include_remotes,
+        show_files=ns.show_files,
+        name_status=ns.name_status,
+        max_files=ns.max_files,
         pathspec=ns.pathspec,
     )
 
