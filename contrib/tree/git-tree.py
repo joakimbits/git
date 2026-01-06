@@ -2,19 +2,28 @@
 # file: git-tree.py
 
 """
-Print the basic file-history tree (touch-commit graph) to stdout.
+git-tree.py
 
-Git-like CLI:
-  python git-tree.py [-C <path>] [--max-commits N]
-                     [--all] [--branches[=<pat>]] [--remotes[=<pat>]] [--tags[=<pat>]]
-                     [--name-only | --name-status] [--max-files N]
-                     -- <pathspec...>
+Two renderers:
 
-Semantics:
-- If no ref selector is provided, the revision set is the default git log set (HEAD).
-- If any selector is provided, the revision set is the union of those selectors.
-- Pathspecs are passed to git after `--` exactly as provided.
-- Crashy by design: git errors print to stderr; Python raises on failures.
+1) DAG renderer (delegates to git):
+   --graph=dag
+   Equivalent-ish to:
+     git log [revset] --graph --oneline --decorate [-n N] [--reverse]
+            [--name-only|--name-status] -- <pathspec...>
+
+2) Tree renderer (custom):
+   --graph=tree
+   Builds a file-touch "branch-out" tree (splits are out-degree >= 2 in the touch graph).
+   --compact collapses linear non-key commits between key nodes (no placeholder lines).
+
+Standard-ish revset selectors:
+  --all
+  --branches[=<pat>]  (repeatable)
+  --remotes[=<pat>]   (repeatable)
+  --tags[=<pat>]      (repeatable)
+
+Pathspecs must follow `--`, exactly like git.
 """
 
 from __future__ import annotations
@@ -102,6 +111,16 @@ class Git:
         )
         return cp.stdout
 
+    def run_passthru(self, args: Sequence[str], *, timeout_s: int = 0) -> None:
+        subprocess.run(
+            ["git", "-C", str(self.cwd), *args],
+            stdout=None,
+            stderr=None,
+            text=True,
+            check=True,
+            timeout=timeout_s if timeout_s > 0 else None,
+        )
+
     def show_toplevel(self) -> Path:
         out = self.run(["rev-parse", "--show-toplevel"], timeout_s=30).strip()
         return Path(out)
@@ -155,15 +174,13 @@ class FileHistoryGraphBuilder:
 
         metas = self._fetch_meta(touch_shas)
 
-        # Labels: if selectors were explicitly provided, match the categories.
-        # If none were provided (HEAD-only), still label local branches + tags (useful context).
-        label_branches = selectors.all or bool(selectors.branches) or (not selectors.any())
+        label_locals = True
         label_remotes = selectors.all or bool(selectors.remotes)
-        label_tags = selectors.all or bool(selectors.tags) or (not selectors.any())
+        label_tags = True
 
         branch_labels = self._branch_labels_for_file(
             pathspecs,
-            include_locals=label_branches,
+            include_locals=label_locals,
             include_remotes=label_remotes,
         )
         tag_labels = self._tag_labels_for_file(pathspecs) if label_tags else {}
@@ -195,9 +212,15 @@ class FileHistoryGraphBuilder:
         max_commits: int,
         selectors: RefSelectors,
     ) -> List[Tuple[str, List[str]]]:
-        # Ref selectors are standard git options: --all/--branches/--remotes/--tags.
-        # If none provided, git log defaults to HEAD.
-        cmd = ["log", *selectors.to_git_args(), "--topo-order", f"-n{max_commits}", "--pretty=format:%H %P", "--", *pathspecs]
+        cmd = [
+            "log",
+            *selectors.to_git_args(),
+            "--topo-order",
+            f"-n{max_commits}",
+            "--pretty=format:%H %P",
+            "--",
+            *pathspecs,
+        ]
         out = self.git.run(cmd, timeout_s=240)
         rows: List[Tuple[str, List[str]]] = []
         for ln in out.splitlines():
@@ -408,26 +431,46 @@ class CommitTouchedFiles:
         return uniq
 
 
-# ------------------------- printer -------------------------
+# ------------------------- tree printer -------------------------
 
 
-class AsciiTreePrinter:
+@dataclass(frozen=True)
+class TreeStyle:
+    tee: str
+    elbow: str
+    vert: str
+    space: str
+
+    @staticmethod
+    def unicode() -> "TreeStyle":
+        return TreeStyle(tee="├─ ", elbow="└─ ", vert="│   ", space="    ")
+
+    @staticmethod
+    def ascii() -> "TreeStyle":
+        return TreeStyle(tee="|-- ", elbow="`-- ", vert="|   ", space="    ")
+
+
+class TreePrinter:
     """Print a rooted forest of commits using the compressed parent graph."""
 
     def __init__(
         self,
         graph: FileHistoryGraph,
         *,
+        style: TreeStyle,
         touched_files: Optional[CommitTouchedFiles] = None,
         show_name_only: bool = False,
         show_name_status: bool = False,
         max_files: int = 0,
+        compact: bool = False,
     ) -> None:
         self.g = graph
+        self.style = style
         self.touched_files = touched_files
         self.show_name_only = show_name_only
         self.show_name_status = show_name_status
         self.max_files = max(0, int(max_files))
+        self.compact = bool(compact)
 
     def print(self) -> None:
         g = self.g
@@ -467,15 +510,18 @@ class AsciiTreePrinter:
                 cur = min(ps, key=lambda x: epoch_map.get(x, 0))
 
         ordered_roots = [primary_root] + [r for r in root_order if r != primary_root]
+        self._print_tree(ordered_roots, children_of)
 
-        if len(ordered_roots) == 1:
-            self._print_tree(ordered_roots, children_of)
-            return
+    def _is_decorated(self, sha: str) -> bool:
+        g = self.g
+        return sha == g.head_file_tip or sha in g.branch_labels or sha in g.tag_labels
 
-        self._print_tree([primary_root], children_of)
-        print()
-        print(f"Other roots ({len(ordered_roots) - 1})")
-        self._print_tree(ordered_roots[1:], children_of)
+    def _is_key_node(self, sha: str, children_of: Dict[str, List[str]], roots: Set[str]) -> bool:
+        if sha in roots:
+            return True
+        if self._is_decorated(sha):
+            return True
+        return len(children_of.get(sha, [])) >= 2
 
     def _format_commit_line(self, sha: str) -> str:
         g = self.g
@@ -500,9 +546,39 @@ class AsciiTreePrinter:
     def _print_tree(self, roots: List[str], children_of: Dict[str, List[str]]) -> None:
         show_files = (self.show_name_only or self.show_name_status) and (self.touched_files is not None)
         name_status = self.show_name_status
+        roots_set = set(roots)
+
+        def print_files(prefix: str, sha: str) -> None:
+            if not show_files:
+                return
+            files = self.touched_files.get(sha, name_status=name_status)
+            if self.max_files and len(files) > self.max_files:
+                shown = files[: self.max_files]
+                more = len(files) - self.max_files
+            else:
+                shown = files
+                more = 0
+
+            for f in shown:
+                print(f"{prefix}· {f}")
+            if more:
+                print(f"{prefix}· ... ({more} more)")
+
+        def compress_chain(start: str) -> str:
+            if not self.compact:
+                return start
+
+            cur = start
+            while True:
+                if self._is_key_node(cur, children_of, roots=roots_set):
+                    return cur
+                kids = children_of.get(cur, [])
+                if len(kids) != 1:
+                    return cur
+                cur = kids[0]
 
         def walk(node: str, prefix: str, is_last: bool, path: Set[str]) -> None:
-            connector = "└─ " if is_last else "├─ "
+            connector = self.style.elbow if is_last else self.style.tee
             line = self._format_commit_line(node)
             if prefix:
                 print(f"{prefix}{connector}{line}")
@@ -514,38 +590,40 @@ class AsciiTreePrinter:
             path2 = set(path)
             path2.add(node)
 
-            child_prefix = prefix + ("    " if is_last else "│   ")
-
-            if show_files:
-                files = self.touched_files.get(node, name_status=name_status)
-                if self.max_files and len(files) > self.max_files:
-                    shown = files[: self.max_files]
-                    more = len(files) - self.max_files
-                else:
-                    shown = files
-                    more = 0
-
-                for f in shown:
-                    print(f"{child_prefix}· {f}")
-                if more:
-                    print(f"{child_prefix}· ... ({more} more)")
+            child_prefix = prefix + (self.style.space if is_last else self.style.vert)
+            print_files(child_prefix, node)
 
             kids = children_of.get(node, [])
-            for i, k in enumerate(kids):
-                walk(k, child_prefix, i == len(kids) - 1, path2)
+            if not kids:
+                return
+
+            endpoints: List[str] = []
+            seen: Set[str] = set()
+            for c in kids:
+                end = compress_chain(c)
+                if end not in seen:
+                    seen.add(end)
+                    endpoints.append(end)
+
+            for i, end in enumerate(endpoints):
+                walk(end, child_prefix, i == len(endpoints) - 1, path2)
 
         for i, r in enumerate(roots):
             walk(r, prefix="", is_last=(i == len(roots) - 1), path=set())
 
 
-# ------------------------- OO CLI -------------------------
+# ------------------------- CLI -------------------------
 
 
 class GitTreeCli:
-    def print(
+    def run(
         self,
         *,
         C: str = ".",
+        graph: str = "tree",
+        graph_style: str = "unicode",
+        compact: bool = False,
+        reverse: bool = False,
         max_commits: int = 2000,
         selectors: RefSelectors,
         name_only: bool = False,
@@ -561,30 +639,83 @@ class GitTreeCli:
         cwd = Path(C).expanduser().resolve()
         git = Git(cwd)
         toplevel = git.show_toplevel()
-
         ps = [p.replace("\\", "/") for p in pathspec]
 
-        graph = FileHistoryGraphBuilder(git).build(
+        if graph == "dag":
+            if compact:
+                raise RuntimeError("--compact is tree-only")
+            self._run_dag(
+                git=git,
+                toplevel=toplevel,
+                selectors=selectors,
+                ps=ps,
+                max_commits=max_commits,
+                reverse=reverse,
+                name_only=name_only,
+                name_status=name_status,
+            )
+            return
+
+        style = TreeStyle.unicode() if graph_style == "unicode" else TreeStyle.ascii()
+        graph_obj = FileHistoryGraphBuilder(git).build(
             pathspecs=ps,
             max_commits=max(1, int(max_commits)),
             selectors=selectors,
         )
-
         touched = CommitTouchedFiles(git, ps) if (name_only or name_status) else None
 
         print(f"Repo: {toplevel}")
         print(f"Pathspec: {ps}")
-        print(f"HEAD branch: {graph.head_branch}")
-        print(f"Touch commits: {len(graph.touch_shas)}")
+        print(f"Revset: {' '.join(selectors.to_git_args()) if selectors.any() else '(default) HEAD'}")
+        print(f"HEAD branch: {graph_obj.head_branch}")
+        print(f"Touch commits: {len(graph_obj.touch_shas)}")
+        if reverse:
+            print("Note: --reverse is a no-op in tree mode (tree is root-first).")
         print()
 
-        AsciiTreePrinter(
-            graph,
+        TreePrinter(
+            graph_obj,
+            style=style,
             touched_files=touched,
             show_name_only=name_only,
             show_name_status=name_status,
             max_files=max_files,
+            compact=compact,
         ).print()
+
+    @staticmethod
+    def _run_dag(
+        *,
+        git: Git,
+        toplevel: Path,
+        selectors: RefSelectors,
+        ps: List[str],
+        max_commits: int,
+        reverse: bool,
+        name_only: bool,
+        name_status: bool,
+    ) -> None:
+        cmd = [
+            "log",
+            *selectors.to_git_args(),
+            "--graph",
+            "--oneline",
+            "--decorate",
+            f"-n{max(1, int(max_commits))}",
+        ]
+        if reverse:
+            cmd.append("--reverse")
+        if name_only:
+            cmd.append("--name-only")
+        if name_status:
+            cmd.append("--name-status")
+        cmd += ["--", *ps]
+
+        print(f"Repo: {toplevel}")
+        print(f"Revset: {' '.join(selectors.to_git_args()) if selectors.any() else '(default) HEAD'}")
+        print(f"Pathspec: {ps}")
+        print()
+        git.run_passthru(cmd)
 
 
 # ------------------------- argparse -------------------------
@@ -593,9 +724,14 @@ class GitTreeCli:
 def _parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("-C", dest="C", default=".", help="run as if started in <path>")
+
+    ap.add_argument("--graph", default="tree", choices=["dag", "tree"])
+    ap.add_argument("--graph-style", default="unicode", choices=["unicode", "ascii"])
+    ap.add_argument("--compact", action="store_true")
+
+    ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--max-commits", type=int, default=2000)
 
-    # Standard git-ish ref selectors for revision sets
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--branches", action="append", nargs="?", const=_SENTINEL_ALL, default=[])
     ap.add_argument("--remotes", action="append", nargs="?", const=_SENTINEL_ALL, default=[])
@@ -604,8 +740,8 @@ def _parse_args() -> argparse.Namespace:
     grp = ap.add_mutually_exclusive_group()
     grp.add_argument("--name-only", action="store_true", help="print touched paths under each commit")
     grp.add_argument("--name-status", action="store_true", help="print touched paths with status under each commit")
-
     ap.add_argument("--max-files", type=int, default=0, help="cap printed files per commit (0=unlimited)")
+
     ap.add_argument("rest", nargs=argparse.REMAINDER, help="use: -- <pathspec...>")
     ns = ap.parse_args()
 
@@ -626,8 +762,12 @@ def _parse_args() -> argparse.Namespace:
 
 def main() -> None:
     ns = _parse_args()
-    GitTreeCli().print(
+    GitTreeCli().run(
         C=ns.C,
+        graph=ns.graph,
+        graph_style=ns.graph_style,
+        compact=ns.compact,
+        reverse=ns.reverse,
         max_commits=ns.max_commits,
         selectors=ns.selectors,
         name_only=ns.name_only,
