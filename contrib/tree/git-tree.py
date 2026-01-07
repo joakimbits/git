@@ -15,7 +15,14 @@ Two renderers:
 2) Tree renderer (custom):
    --graph=tree
    Builds a file-touch "branch-out" tree (splits are out-degree >= 2 in the touch graph).
-   --compact collapses linear non-key commits between key nodes (no placeholder lines).
+
+   --compact collapses linear non-key commits between key nodes.
+   --supercompact implies --compact, and ignores tag-only commits for key-node selection
+   (tags still show on printed commits, but won't change tree shape).
+
+For --name-status in compact modes:
+  The first printed appearance of a file path along a tree path is shown as "A"
+  (even if Git reports "M"), because the true add-commit may be hidden by compaction.
 
 Standard-ish revset selectors:
   --all
@@ -418,17 +425,9 @@ class CommitTouchedFiles:
             *self.pathspecs,
         ]
         out = self.git.run(args, timeout_s=120)
-
-        lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-        seen: Set[str] = set()
-        uniq: List[str] = []
-        for ln in lines:
-            if ln not in seen:
-                seen.add(ln)
-                uniq.append(ln)
-
-        cache[sha] = uniq
-        return uniq
+        lines = [ln.rstrip("\n") for ln in out.splitlines() if ln.strip()]
+        cache[sha] = lines
+        return lines
 
 
 # ------------------------- tree printer -------------------------
@@ -463,6 +462,7 @@ class TreePrinter:
         show_name_status: bool = False,
         max_files: int = 0,
         compact: bool = False,
+        supercompact: bool = False,
     ) -> None:
         self.g = graph
         self.style = style
@@ -470,7 +470,8 @@ class TreePrinter:
         self.show_name_only = show_name_only
         self.show_name_status = show_name_status
         self.max_files = max(0, int(max_files))
-        self.compact = bool(compact)
+        self.compact = bool(compact or supercompact)
+        self.supercompact = bool(supercompact)
 
     def print(self) -> None:
         g = self.g
@@ -512,14 +513,20 @@ class TreePrinter:
         ordered_roots = [primary_root] + [r for r in root_order if r != primary_root]
         self._print_tree(ordered_roots, children_of)
 
-    def _is_decorated(self, sha: str) -> bool:
+    def _is_key_decorated(self, sha: str) -> bool:
         g = self.g
-        return sha == g.head_file_tip or sha in g.branch_labels or sha in g.tag_labels
+        if sha == g.head_file_tip:
+            return True
+        if sha in g.branch_labels:
+            return True
+        if not self.supercompact and sha in g.tag_labels:
+            return True
+        return False
 
     def _is_key_node(self, sha: str, children_of: Dict[str, List[str]], roots: Set[str]) -> bool:
         if sha in roots:
             return True
-        if self._is_decorated(sha):
+        if self._is_key_decorated(sha):
             return True
         return len(children_of.get(sha, [])) >= 2
 
@@ -543,26 +550,100 @@ class TreePrinter:
         prefix = f"[{' | '.join(pre)}] " if pre else ""
         return f"{prefix}{short}  {date_part}  {subject}".rstrip()
 
+    @staticmethod
+    def _parse_name_status_line(line: str) -> Tuple[str, List[str]]:
+        # Typical:
+        #   M\tpath
+        #   A\tpath
+        #   D\tpath
+        #   R100\told\tnew
+        #   C100\told\tnew
+        parts = line.split("\t")
+        if not parts:
+            return "", []
+        return parts[0], parts[1:]
+
+    def _rewrite_first_seen_as_add(
+        self,
+        lines: List[str],
+        *,
+        seen_paths: Set[str],
+        enable: bool,
+    ) -> Tuple[List[str], Set[str]]:
+        if not enable:
+            return lines, seen_paths
+
+        out: List[str] = []
+        seen_next = set(seen_paths)
+
+        for ln in lines:
+            status, paths = self._parse_name_status_line(ln)
+            if not status or not paths:
+                out.append(ln)
+                continue
+
+            code = status[0]  # M/A/D/R/C/...
+            key_path = paths[-1]  # use "new" path for R/C, else path itself
+
+            if code != "D" and key_path not in seen_next:
+                # First time this path is shown in this compact view along this branch-path.
+                # Even if Git says M (because the add is hidden upstream), show A.
+                if code != "A":
+                    if status.startswith(("R", "C")):
+                        # Preserve score (R100/C100) and rewrite leading code.
+                        status = "A" + status[1:]
+                        ln = "\t".join([status, *paths])
+                    else:
+                        ln = "\t".join(["A", *paths])
+
+                seen_next.add(key_path)
+            else:
+                # Keep seen tracking for non-deletions.
+                if code != "D":
+                    seen_next.add(key_path)
+
+            out.append(ln)
+
+        return out, seen_next
+
     def _print_tree(self, roots: List[str], children_of: Dict[str, List[str]]) -> None:
         show_files = (self.show_name_only or self.show_name_status) and (self.touched_files is not None)
         name_status = self.show_name_status
         roots_set = set(roots)
 
-        def print_files(prefix: str, sha: str) -> None:
+        def print_files(prefix: str, sha: str, seen_paths: Set[str]) -> Set[str]:
             if not show_files:
-                return
-            files = self.touched_files.get(sha, name_status=name_status)
-            if self.max_files and len(files) > self.max_files:
-                shown = files[: self.max_files]
-                more = len(files) - self.max_files
+                return seen_paths
+
+            lines = self.touched_files.get(sha, name_status=name_status)
+
+            if name_status:
+                lines, seen_next = self._rewrite_first_seen_as_add(
+                    lines,
+                    seen_paths=seen_paths,
+                    enable=self.compact,  # only rewrite in compact modes
+                )
             else:
-                shown = files
+                seen_next = set(seen_paths)
+                # name-only: no status to rewrite, but track first-seen anyway in compact modes
+                if self.compact:
+                    for p in lines:
+                        if p.strip():
+                            seen_next.add(p.strip())
+
+            if self.max_files and len(lines) > self.max_files:
+                shown = lines[: self.max_files]
+                more = len(lines) - self.max_files
+            else:
+                shown = lines
                 more = 0
 
-            for f in shown:
-                print(f"{prefix}· {f}")
+            for ln in shown:
+                print(f"{prefix}· {ln}")
             if more:
                 print(f"{prefix}· ... ({more} more)")
+
+            return seen_next
 
         def compress_chain(start: str) -> str:
             if not self.compact:
@@ -577,7 +658,7 @@ class TreePrinter:
                     return cur
                 cur = kids[0]
 
-        def walk(node: str, prefix: str, is_last: bool, path: Set[str]) -> None:
+        def walk(node: str, prefix: str, is_last: bool, path: Set[str], seen_paths: Set[str]) -> None:
             connector = self.style.elbow if is_last else self.style.tee
             line = self._format_commit_line(node)
             if prefix:
@@ -591,25 +672,26 @@ class TreePrinter:
             path2.add(node)
 
             child_prefix = prefix + (self.style.space if is_last else self.style.vert)
-            print_files(child_prefix, node)
+            seen2 = print_files(child_prefix, node, seen_paths)
 
             kids = children_of.get(node, [])
             if not kids:
                 return
 
             endpoints: List[str] = []
-            seen: Set[str] = set()
+            seen_end: Set[str] = set()
             for c in kids:
                 end = compress_chain(c)
-                if end not in seen:
-                    seen.add(end)
+                if end not in seen_end:
+                    seen_end.add(end)
                     endpoints.append(end)
 
             for i, end in enumerate(endpoints):
-                walk(end, child_prefix, i == len(endpoints) - 1, path2)
+                # copy "seen" per branch path; this is what makes first-appearance A work per branch
+                walk(end, child_prefix, i == len(endpoints) - 1, path2, set(seen2))
 
         for i, r in enumerate(roots):
-            walk(r, prefix="", is_last=(i == len(roots) - 1), path=set())
+            walk(r, prefix="", is_last=(i == len(roots) - 1), path=set(), seen_paths=set())
 
 
 # ------------------------- CLI -------------------------
@@ -623,6 +705,7 @@ class GitTreeCli:
         graph: str = "tree",
         graph_style: str = "unicode",
         compact: bool = False,
+        supercompact: bool = False,
         reverse: bool = False,
         max_commits: int = 2000,
         selectors: RefSelectors,
@@ -642,8 +725,8 @@ class GitTreeCli:
         ps = [p.replace("\\", "/") for p in pathspec]
 
         if graph == "dag":
-            if compact:
-                raise RuntimeError("--compact is tree-only")
+            if compact or supercompact:
+                raise RuntimeError("--compact/--supercompact are tree-only")
             self._run_dag(
                 git=git,
                 toplevel=toplevel,
@@ -671,6 +754,10 @@ class GitTreeCli:
         print(f"Touch commits: {len(graph_obj.touch_shas)}")
         if reverse:
             print("Note: --reverse is a no-op in tree mode (tree is root-first).")
+        if supercompact:
+            print("Mode: supercompact (tags do not affect tree shape)")
+        elif compact:
+            print("Mode: compact")
         print()
 
         TreePrinter(
@@ -681,6 +768,7 @@ class GitTreeCli:
             show_name_status=name_status,
             max_files=max_files,
             compact=compact,
+            supercompact=supercompact,
         ).print()
 
     @staticmethod
@@ -727,7 +815,13 @@ def _parse_args() -> argparse.Namespace:
 
     ap.add_argument("--graph", default="tree", choices=["dag", "tree"])
     ap.add_argument("--graph-style", default="unicode", choices=["unicode", "ascii"])
+
     ap.add_argument("--compact", action="store_true")
+    ap.add_argument(
+        "--supercompact",
+        action="store_true",
+        help="implies --compact; tags do not affect tree shape",
+    )
 
     ap.add_argument("--reverse", action="store_true")
     ap.add_argument("--max-commits", type=int, default=2000)
@@ -767,6 +861,7 @@ def main() -> None:
         graph=ns.graph,
         graph_style=ns.graph_style,
         compact=ns.compact,
+        supercompact=ns.supercompact,
         reverse=ns.reverse,
         max_commits=ns.max_commits,
         selectors=ns.selectors,
