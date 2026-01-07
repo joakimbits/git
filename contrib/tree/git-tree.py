@@ -8,29 +8,25 @@ Two renderers:
 
 1) DAG renderer (delegates to git):
    --graph=dag
-   Equivalent-ish to:
-     git log [revset] --graph --oneline --decorate [-n N] [--reverse]
-            [--name-only|--name-status] -- <pathspec...>
 
 2) Tree renderer (custom):
    --graph=tree
-   Builds a file-touch "branch-out" tree (splits are out-degree >= 2 in the touch graph).
+   Builds a "branch-out tree" using a commit parent graph limited by pathspec(s)
+   (or repo-wide if no pathspec is provided).
 
-   --compact collapses linear non-key commits between key nodes.
-   --supercompact implies --compact, and ignores tag-only commits for key-node selection
-   (tags still show on printed commits, but won't change tree shape).
+Compaction:
+- --compact collapses linear non-key commits between key nodes.
+- --supercompact implies --compact and ignores tag-only commits for key-node selection
+  (tags still print on commits that are printed).
 
-For --name-status in compact modes:
-  The first printed appearance of a file path along a tree path is shown as "A"
-  (even if Git reports "M"), because the true add-commit may be hidden by compaction.
+Touched files printing:
+- --name-only / --name-status prints file changes under each printed node.
+- We compute touched files by comparing the node to its *visible parent*:
+    git diff [--name-only|--name-status] --no-renames <parent> <node> -- <pathspec...>
+  Root nodes use:
+    git diff-tree --root [--name-only|--name-status] --no-renames -r <node> -- <pathspec...>
 
-Standard-ish revset selectors:
-  --all
-  --branches[=<pat>]  (repeatable)
-  --remotes[=<pat>]   (repeatable)
-  --tags[=<pat>]      (repeatable)
-
-Pathspecs must follow `--`, exactly like git.
+This yields correct A/M/D summaries for compacted segments.
 """
 
 from __future__ import annotations
@@ -64,7 +60,7 @@ class FileHistoryGraph:
     metas: Dict[str, CommitMeta]
     branch_labels: Dict[str, List[str]]
     tag_labels: Dict[str, List[str]]
-    head_file_tip: str
+    head_tip: str
     head_branch: str
 
 
@@ -137,7 +133,7 @@ class Git:
 
 
 class FileHistoryGraphBuilder:
-    """Builds the touch-commit graph and labels for a given pathspec list."""
+    """Builds the commit parent graph and ref labels. If pathspecs empty => repo-wide."""
 
     def __init__(self, git: Git) -> None:
         self.git = git
@@ -150,23 +146,23 @@ class FileHistoryGraphBuilder:
         selectors: RefSelectors,
     ) -> FileHistoryGraph:
         head_branch = self._head_branch()
-        head_file_tip = self._head_file_tip_sha(pathspecs)
+        head_tip = self._head_tip(pathspecs)
 
-        touch_rows = self._touch_log_rows(pathspecs, max_commits=max_commits, selectors=selectors)
-        touch_shas = [sha for sha, _ in touch_rows]
-        touch_set = set(touch_shas)
+        rows = self._log_rows(pathspecs, max_commits=max_commits, selectors=selectors)
+        shas = [sha for sha, _ in rows]
+        sha_set = set(shas)
 
-        parents_map = self._ancestor_parent_graph(touch_shas)
+        parents_map = self._ancestor_parent_graph(shas)
 
         nearest_cache: Dict[str, List[str]] = {}
         touch_parents: Dict[str, List[str]] = {}
-        for sha, direct_parents in touch_rows:
+        for sha, direct_parents in rows:
             parents_out: List[str] = []
             for p in direct_parents:
                 parents_out.extend(
-                    self._nearest_touch_commits(
+                    self._nearest_commits_in_set(
                         p,
-                        touch_set=touch_set,
+                        sha_set=sha_set,
                         parents_map=parents_map,
                         cache=nearest_cache,
                     )
@@ -179,40 +175,38 @@ class FileHistoryGraphBuilder:
                     uniq.append(x)
             touch_parents[sha] = uniq
 
-        metas = self._fetch_meta(touch_shas)
+        metas = self._fetch_meta(shas)
 
         label_locals = True
         label_remotes = selectors.all or bool(selectors.remotes)
-        label_tags = True
 
-        branch_labels = self._branch_labels_for_file(
-            pathspecs,
-            include_locals=label_locals,
-            include_remotes=label_remotes,
-        )
-        tag_labels = self._tag_labels_for_file(pathspecs) if label_tags else {}
+        branch_labels = self._branch_labels(pathspecs, include_locals=label_locals, include_remotes=label_remotes)
+        tag_labels = self._tag_labels(pathspecs)
 
         return FileHistoryGraph(
-            touch_shas=touch_shas,
+            touch_shas=shas,
             touch_parents=touch_parents,
             metas=metas,
             branch_labels=branch_labels,
             tag_labels=tag_labels,
-            head_file_tip=head_file_tip,
+            head_tip=head_tip,
             head_branch=head_branch,
         )
 
     def _head_branch(self) -> str:
         return self.git.run(["rev-parse", "--abbrev-ref", "HEAD"], timeout_s=30).strip()
 
-    def _head_file_tip_sha(self, pathspecs: List[str]) -> str:
+    def _head_tip(self, pathspecs: List[str]) -> str:
+        if not pathspecs:
+            return self.git.run(["rev-parse", "HEAD"], timeout_s=30).strip()
+
         out = self.git.run(
             ["log", "-n", "1", "--pretty=format:%H", "HEAD", "--", *pathspecs],
             timeout_s=120,
         ).strip()
         return out.splitlines()[0].strip() if out else ""
 
-    def _touch_log_rows(
+    def _log_rows(
         self,
         pathspecs: List[str],
         *,
@@ -225,9 +219,10 @@ class FileHistoryGraphBuilder:
             "--topo-order",
             f"-n{max_commits}",
             "--pretty=format:%H %P",
-            "--",
-            *pathspecs,
         ]
+        if pathspecs:
+            cmd += ["--", *pathspecs]
+
         out = self.git.run(cmd, timeout_s=240)
         rows: List[Tuple[str, List[str]]] = []
         for ln in out.splitlines():
@@ -280,11 +275,11 @@ class FileHistoryGraphBuilder:
                 )
         return metas
 
-    def _nearest_touch_commits(
+    def _nearest_commits_in_set(
         self,
         start_sha: str,
         *,
-        touch_set: Set[str],
+        sha_set: Set[str],
         parents_map: Dict[str, List[str]],
         cache: Dict[str, List[str]],
         max_bfs: int = 50_000,
@@ -293,7 +288,7 @@ class FileHistoryGraphBuilder:
             return []
         if start_sha in cache:
             return cache[start_sha]
-        if start_sha in touch_set:
+        if start_sha in sha_set:
             cache[start_sha] = [start_sha]
             return cache[start_sha]
 
@@ -315,7 +310,7 @@ class FileHistoryGraphBuilder:
             if best_depth is not None and depth > best_depth:
                 break
 
-            if sha in touch_set:
+            if sha in sha_set:
                 if best_depth is None:
                     best_depth = depth
                 if depth == best_depth:
@@ -336,7 +331,7 @@ class FileHistoryGraphBuilder:
         cache[start_sha] = uniq
         return uniq
 
-    def _branches_list(self, *, include_locals: bool, include_remotes: bool) -> List[str]:
+    def _refs_list(self, *, include_locals: bool, include_remotes: bool) -> List[str]:
         refs: List[str] = []
         if include_locals:
             refs.append("refs/heads")
@@ -350,14 +345,17 @@ class FileHistoryGraphBuilder:
         names.sort(key=str.casefold)
         return names
 
-    def _file_tip_sha(self, ref: str, pathspecs: List[str]) -> str:
+    def _tip_sha(self, ref: str, pathspecs: List[str]) -> str:
+        if not pathspecs:
+            return self.git.run(["rev-parse", ref], timeout_s=60).strip()
+
         out = self.git.run(
             ["log", "-n", "1", "--pretty=format:%H", ref, "--", *pathspecs],
             timeout_s=120,
         ).strip()
         return out.splitlines()[0].strip() if out else ""
 
-    def _branch_labels_for_file(
+    def _branch_labels(
         self,
         pathspecs: List[str],
         *,
@@ -365,26 +363,23 @@ class FileHistoryGraphBuilder:
         include_remotes: bool,
     ) -> Dict[str, List[str]]:
         commit_to_branches: Dict[str, List[str]] = {}
-        for b in self._branches_list(include_locals=include_locals, include_remotes=include_remotes):
-            tip = self._file_tip_sha(b, pathspecs)
+        for b in self._refs_list(include_locals=include_locals, include_remotes=include_remotes):
+            tip = self._tip_sha(b, pathspecs)
             if tip:
                 commit_to_branches.setdefault(tip, []).append(b)
         for sha in commit_to_branches:
             commit_to_branches[sha].sort(key=str.casefold)
         return commit_to_branches
 
-    def _tag_labels_for_file(self, pathspecs: List[str]) -> Dict[str, List[str]]:
+    def _tag_labels(self, pathspecs: List[str]) -> Dict[str, List[str]]:
         tags_out = self.git.run(["tag", "--list"], timeout_s=120)
         tags = [t.strip() for t in tags_out.splitlines() if t.strip()]
 
         commit_to_tags: Dict[str, List[str]] = {}
         for tag in tags:
-            sha = self.git.run(
-                ["log", "-n", "1", "--pretty=format:%H", tag, "--", *pathspecs],
-                timeout_s=120,
-            ).strip()
-            if sha:
-                commit_to_tags.setdefault(sha, []).append(tag)
+            tip = self._tip_sha(tag, pathspecs)
+            if tip:
+                commit_to_tags.setdefault(tip, []).append(tag)
 
         for sha in commit_to_tags:
             commit_to_tags[sha].sort(key=str.casefold)
@@ -400,33 +395,53 @@ class FileHistoryGraphBuilder:
 
 
 class CommitTouchedFiles:
-    """Per-commit touched-paths provider (cached)."""
+    """
+    Provide touched files for a node by comparing it with its *visible parent*.
+
+    Root node:
+      git diff-tree --root --no-renames -r --name-status <sha> -- <pathspec...>
+
+    Edge parent->node:
+      git diff --no-renames --name-status <parent> <sha> -- <pathspec...>
+    """
 
     def __init__(self, git: Git, pathspecs: List[str]) -> None:
         self.git = git
         self.pathspecs = pathspecs
-        self._cache_name_only: Dict[str, List[str]] = {}
-        self._cache_name_status: Dict[str, List[str]] = {}
+        self._cache: Dict[Tuple[Optional[str], str, bool], List[str]] = {}
 
-    def get(self, sha: str, *, name_status: bool) -> List[str]:
-        cache = self._cache_name_status if name_status else self._cache_name_only
-        if sha in cache:
-            return cache[sha]
+    def get(self, sha: str, *, parent_sha: Optional[str], name_status: bool) -> List[str]:
+        key = (parent_sha, sha, name_status)
+        if key in self._cache:
+            return self._cache[key]
 
-        args = [
-            "diff-tree",
-            "--root",
-            "-m",
-            "-r",
-            "--no-commit-id",
-            "--name-status" if name_status else "--name-only",
-            sha,
-            "--",
-            *self.pathspecs,
-        ]
-        out = self.git.run(args, timeout_s=120)
+        if parent_sha:
+            args = [
+                "diff",
+                "--no-renames",
+                "--name-status" if name_status else "--name-only",
+                parent_sha,
+                sha,
+            ]
+            if self.pathspecs:
+                args += ["--", *self.pathspecs]
+            out = self.git.run(args, timeout_s=240)
+        else:
+            args = [
+                "diff-tree",
+                "--root",
+                "--no-renames",
+                "-r",
+                "--no-commit-id",
+                "--name-status" if name_status else "--name-only",
+                sha,
+            ]
+            if self.pathspecs:
+                args += ["--", *self.pathspecs]
+            out = self.git.run(args, timeout_s=240)
+
         lines = [ln.rstrip("\n") for ln in out.splitlines() if ln.strip()]
-        cache[sha] = lines
+        self._cache[key] = lines
         return lines
 
 
@@ -450,7 +465,7 @@ class TreeStyle:
 
 
 class TreePrinter:
-    """Print a rooted forest of commits using the compressed parent graph."""
+    """Print a rooted forest using the computed nearest-parent mapping."""
 
     def __init__(
         self,
@@ -476,7 +491,7 @@ class TreePrinter:
     def print(self) -> None:
         g = self.g
         if not g.touch_shas:
-            print("No commits touch that pathspec.")
+            print("No commits in selection.")
             return
 
         children_of: Dict[str, List[str]] = {sha: [] for sha in g.touch_shas}
@@ -497,8 +512,8 @@ class TreePrinter:
         root_order = sorted(roots, key=lambda s: epoch_map.get(s, 0))
         primary_root = root_order[0]
 
-        if g.head_file_tip and g.head_file_tip in set(g.touch_shas):
-            cur = g.head_file_tip
+        if g.head_tip and g.head_tip in set(g.touch_shas):
+            cur = g.head_tip
             seen: Set[str] = set()
             while True:
                 if cur in seen:
@@ -515,7 +530,7 @@ class TreePrinter:
 
     def _is_key_decorated(self, sha: str) -> bool:
         g = self.g
-        if sha == g.head_file_tip:
+        if sha == g.head_tip:
             return True
         if sha in g.branch_labels:
             return True
@@ -538,7 +553,7 @@ class TreePrinter:
         subject = (m.subject if m else "")
 
         pre: List[str] = []
-        if sha == g.head_file_tip:
+        if sha == g.head_tip:
             pre.append("HEAD")
         b = ", ".join(g.branch_labels.get(sha, []))
         if b:
@@ -550,86 +565,15 @@ class TreePrinter:
         prefix = f"[{' | '.join(pre)}] " if pre else ""
         return f"{prefix}{short}  {date_part}  {subject}".rstrip()
 
-    @staticmethod
-    def _parse_name_status_line(line: str) -> Tuple[str, List[str]]:
-        # Typical:
-        #   M\tpath
-        #   A\tpath
-        #   D\tpath
-        #   R100\told\tnew
-        #   C100\told\tnew
-        parts = line.split("\t")
-        if not parts:
-            return "", []
-        return parts[0], parts[1:]
-
-    def _rewrite_first_seen_as_add(
-        self,
-        lines: List[str],
-        *,
-        seen_paths: Set[str],
-        enable: bool,
-    ) -> Tuple[List[str], Set[str]]:
-        if not enable:
-            return lines, seen_paths
-
-        out: List[str] = []
-        seen_next = set(seen_paths)
-
-        for ln in lines:
-            status, paths = self._parse_name_status_line(ln)
-            if not status or not paths:
-                out.append(ln)
-                continue
-
-            code = status[0]  # M/A/D/R/C/...
-            key_path = paths[-1]  # use "new" path for R/C, else path itself
-
-            if code != "D" and key_path not in seen_next:
-                # First time this path is shown in this compact view along this branch-path.
-                # Even if Git says M (because the add is hidden upstream), show A.
-                if code != "A":
-                    if status.startswith(("R", "C")):
-                        # Preserve score (R100/C100) and rewrite leading code.
-                        status = "A" + status[1:]
-                        ln = "\t".join([status, *paths])
-                    else:
-                        ln = "\t".join(["A", *paths])
-
-                seen_next.add(key_path)
-            else:
-                # Keep seen tracking for non-deletions.
-                if code != "D":
-                    seen_next.add(key_path)
-
-            out.append(ln)
-
-        return out, seen_next
-
     def _print_tree(self, roots: List[str], children_of: Dict[str, List[str]]) -> None:
         show_files = (self.show_name_only or self.show_name_status) and (self.touched_files is not None)
         name_status = self.show_name_status
         roots_set = set(roots)
 
-        def print_files(prefix: str, sha: str, seen_paths: Set[str]) -> Set[str]:
+        def print_files(prefix: str, sha: str, parent_sha: Optional[str]) -> None:
             if not show_files:
-                return seen_paths
-
-            lines = self.touched_files.get(sha, name_status=name_status)
-
-            if name_status:
-                lines, seen_next = self._rewrite_first_seen_as_add(
-                    lines,
-                    seen_paths=seen_paths,
-                    enable=self.compact,  # only rewrite in compact modes
-                )
-            else:
-                seen_next = set(seen_paths)
-                # name-only: no status to rewrite, but track first-seen anyway in compact modes
-                if self.compact:
-                    for p in lines:
-                        if p.strip():
-                            seen_next.add(p.strip())
+                return
+            lines = self.touched_files.get(sha, parent_sha=parent_sha, name_status=name_status)
 
             if self.max_files and len(lines) > self.max_files:
                 shown = lines[: self.max_files]
@@ -643,12 +587,9 @@ class TreePrinter:
             if more:
                 print(f"{prefix}· ... ({more} more)")
 
-            return seen_next
-
-        def compress_chain(start: str) -> str:
+        def compress_chain(start: str, *, base_visible_parent: str) -> str:
             if not self.compact:
                 return start
-
             cur = start
             while True:
                 if self._is_key_node(cur, children_of, roots=roots_set):
@@ -658,7 +599,14 @@ class TreePrinter:
                     return cur
                 cur = kids[0]
 
-        def walk(node: str, prefix: str, is_last: bool, path: Set[str], seen_paths: Set[str]) -> None:
+        def walk(
+            node: str,
+            *,
+            prefix: str,
+            is_last: bool,
+            path: Set[str],
+            visible_parent: Optional[str],
+        ) -> None:
             connector = self.style.elbow if is_last else self.style.tee
             line = self._format_commit_line(node)
             if prefix:
@@ -672,7 +620,7 @@ class TreePrinter:
             path2.add(node)
 
             child_prefix = prefix + (self.style.space if is_last else self.style.vert)
-            seen2 = print_files(child_prefix, node, seen_paths)
+            print_files(child_prefix, node, visible_parent)
 
             kids = children_of.get(node, [])
             if not kids:
@@ -681,17 +629,28 @@ class TreePrinter:
             endpoints: List[str] = []
             seen_end: Set[str] = set()
             for c in kids:
-                end = compress_chain(c)
+                end = compress_chain(c, base_visible_parent=node)
                 if end not in seen_end:
                     seen_end.add(end)
                     endpoints.append(end)
 
             for i, end in enumerate(endpoints):
-                # copy "seen" per branch path; this is what makes first-appearance A work per branch
-                walk(end, child_prefix, i == len(endpoints) - 1, path2, set(seen2))
+                walk(
+                    end,
+                    prefix=child_prefix,
+                    is_last=(i == len(endpoints) - 1),
+                    path=path2,
+                    visible_parent=node,  # diff against visible parent => correct segment summary
+                )
 
         for i, r in enumerate(roots):
-            walk(r, prefix="", is_last=(i == len(roots) - 1), path=set(), seen_paths=set())
+            walk(
+                r,
+                prefix="",
+                is_last=(i == len(roots) - 1),
+                path=set(),
+                visible_parent=None,  # root: diff-tree --root
+            )
 
 
 # ------------------------- CLI -------------------------
@@ -714,15 +673,13 @@ class GitTreeCli:
         max_files: int = 0,
         pathspec: Optional[List[str]] = None,
     ) -> None:
-        if not pathspec:
-            raise RuntimeError("pathspec is required after --")
         if name_only and name_status:
             raise RuntimeError("use at most one of --name-only or --name-status")
 
         cwd = Path(C).expanduser().resolve()
         git = Git(cwd)
         toplevel = git.show_toplevel()
-        ps = [p.replace("\\", "/") for p in pathspec]
+        ps = [p.replace("\\", "/") for p in (pathspec or [])]
 
         if graph == "dag":
             if compact or supercompact:
@@ -748,10 +705,10 @@ class GitTreeCli:
         touched = CommitTouchedFiles(git, ps) if (name_only or name_status) else None
 
         print(f"Repo: {toplevel}")
-        print(f"Pathspec: {ps}")
+        print(f"Pathspec: {ps if ps else '(none)'}")
         print(f"Revset: {' '.join(selectors.to_git_args()) if selectors.any() else '(default) HEAD'}")
         print(f"HEAD branch: {graph_obj.head_branch}")
-        print(f"Touch commits: {len(graph_obj.touch_shas)}")
+        print(f"Commits: {len(graph_obj.touch_shas)}")
         if reverse:
             print("Note: --reverse is a no-op in tree mode (tree is root-first).")
         if supercompact:
@@ -797,11 +754,12 @@ class GitTreeCli:
             cmd.append("--name-only")
         if name_status:
             cmd.append("--name-status")
-        cmd += ["--", *ps]
+        if ps:
+            cmd += ["--", *ps]
 
         print(f"Repo: {toplevel}")
         print(f"Revset: {' '.join(selectors.to_git_args()) if selectors.any() else '(default) HEAD'}")
-        print(f"Pathspec: {ps}")
+        print(f"Pathspec: {ps if ps else '(none)'}")
         print()
         git.run_passthru(cmd)
 
@@ -832,18 +790,19 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--tags", action="append", nargs="?", const=_SENTINEL_ALL, default=[])
 
     grp = ap.add_mutually_exclusive_group()
-    grp.add_argument("--name-only", action="store_true", help="print touched paths under each commit")
-    grp.add_argument("--name-status", action="store_true", help="print touched paths with status under each commit")
-    ap.add_argument("--max-files", type=int, default=0, help="cap printed files per commit (0=unlimited)")
+    grp.add_argument("--name-only", action="store_true")
+    grp.add_argument("--name-status", action="store_true")
+    ap.add_argument("--max-files", type=int, default=0, help="0=unlimited")
 
-    ap.add_argument("rest", nargs=argparse.REMAINDER, help="use: -- <pathspec...>")
+    ap.add_argument("rest", nargs=argparse.REMAINDER, help="optional: -- <pathspec...>")
     ns = ap.parse_args()
 
-    if not ns.rest or ns.rest[0] != "--":
-        raise SystemExit("usage: git-tree.py [-C <path>] [opts] -- <pathspec...>")
-    ns.pathspec = [p for p in ns.rest[1:] if p.strip()]
-    if not ns.pathspec:
-        raise SystemExit("need at least one pathspec after --")
+    ns.pathspec = []
+    if ns.rest:
+        if ns.rest[0] == "--":
+            ns.pathspec = [p for p in ns.rest[1:] if p.strip()]
+        else:
+            raise SystemExit("pathspecs must follow `--` (or omit `--` entirely for none)")
 
     ns.selectors = RefSelectors(
         all=bool(ns.all),
