@@ -1,125 +1,75 @@
 #!/usr/bin/env python3
 # file: git-tree.py
+"""
+Contrib prototype: render a file-history "tree" view plus a "dag" passthrough view.
+
+Key behaviors:
+- Tree view reuses git's own commit-line formatting (oneline/pretty/format/decorate) via `git show -s`.
+- Captured git output forces color like `git log --color=auto` would on a TTY.
+- Synthetic touch-tip decorations are only injected when git's decoration (%d) is empty.
+- supercompact: prefer local branch over remote for synthetic touch-tip refs.
+"""
 
 from __future__ import annotations
 
 import argparse
+import os
+import re
 import subprocess
+import sys
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Deque, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 
-# ------------------------- model -------------------------
-
-
-@dataclass(frozen=True)
-class CommitMeta:
-    sha: str
-    author: str
-    date_iso: str
-    subject: str
-    epoch: int
-
-
-@dataclass(frozen=True)
-class HistoryGraph:
-    shas: List[str]
-    parents: Dict[str, List[str]]  # compressed to nearest-in-set parents
-    metas: Dict[str, CommitMeta]
-    branch_labels: Dict[str, List[str]]  # sha -> [refname...]
-    tag_labels: Dict[str, List[str]]     # sha -> [tag...]
-    head_tip: str
-    head_branch: str
-
-
-# ------------------------- git runner -------------------------
+# ---------------------------- git runner (crash on failure) ----------------------------
 
 
 class Git:
-    """Minimal git runner; crashes on git failure and lets git print stderr."""
+    def __init__(self, repo: Path) -> None:
+        self.repo = repo
 
-    def __init__(self, cwd: Path) -> None:
-        self.cwd = cwd
-
-    def run(
-        self,
-        args: Sequence[str],
-        *,
-        timeout_s: int = 60,
-        stdin_text: Optional[str] = None,
-    ) -> str:
+    def run(self, args: Sequence[str], *, timeout_s: int = 120, stdin_text: Optional[str] = None) -> str:
         cp = subprocess.run(
-            ["git", "-C", str(self.cwd), *args],
+            ["git", "-C", str(self.repo), *args],
             input=stdin_text,
             stdout=subprocess.PIPE,
-            stderr=None,
+            stderr=None,  # let git print to stderr on crash
             text=True,
             check=True,
             timeout=timeout_s,
         )
         return cp.stdout
 
-    def run_passthru(self, args: Sequence[str], *, timeout_s: int = 0) -> None:
+    def run_bytes(self, args: Sequence[str], *, timeout_s: int = 120, stdin_bytes: Optional[bytes] = None) -> bytes:
+        cp = subprocess.run(
+            ["git", "-C", str(self.repo), *args],
+            input=stdin_bytes,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            check=True,
+            timeout=timeout_s,
+        )
+        return cp.stdout
+
+    def run_passthru(self, args: Sequence[str]) -> None:
         subprocess.run(
-            ["git", "-C", str(self.cwd), *args],
+            ["git", "-C", str(self.repo), *args],
             stdout=None,
             stderr=None,
-            text=True,
             check=True,
-            timeout=timeout_s if timeout_s > 0 else None,
         )
 
-    def toplevel(self) -> Path:
-        return Path(self.run(["rev-parse", "--show-toplevel"], timeout_s=30).strip())
+
+def _git_env_no_pager() -> Dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_PAGER"] = "cat"
+    env["PAGER"] = "cat"
+    return env
 
 
-# ------------------------- argument passthrough split -------------------------
-
-
-_DIFF_FLAG_SET = {
-    "--name-only",
-    "--name-status",
-    "--stat",
-    "--numstat",
-    "--shortstat",
-    "--patch",
-    "-p",
-    "-w",
-    "-b",
-    "--ignore-space-change",
-    "--ignore-all-space",
-    "--ignore-space-at-eol",
-    "--ignore-cr-at-eol",
-    "--minimal",
-    "--patience",
-    "--histogram",
-    "--find-copies-harder",
-    "--no-renames",
-    "-M",
-    "-C",
-}
-
-_DIFF_PREFIXES = (
-    "--diff-filter=",
-    "--find-renames",
-    "--find-renames=",
-    "--find-copies",
-    "--find-copies=",
-    "--diff-algorithm=",
-    "--word-diff",
-    "--word-diff=",
-    "--unified=",
-    "--color",
-    "--color=",
-)
-
-_ORDER_FLAGS = {
-    "--topo-order",
-    "--date-order",
-    "--author-date-order",
-}
+# ---------------------------- argv split / passthrough ----------------------------
 
 
 def _split_git_and_pathspec(rest: List[str]) -> Tuple[List[str], List[str]]:
@@ -129,96 +79,231 @@ def _split_git_and_pathspec(rest: List[str]) -> Tuple[List[str], List[str]]:
     return rest, []
 
 
-def _is_diffish(arg: str) -> bool:
-    if arg in _DIFF_FLAG_SET:
-        return True
-    if any(arg.startswith(p) for p in _DIFF_PREFIXES):
-        return True
-    if arg.startswith("-U") and len(arg) > 2:  # e.g. -U3
-        return True
-    return False
+def _contains_git_graph_arg(args: List[str]) -> bool:
+    return any(a == "--graph" or a.startswith("--graph=") for a in args)
 
 
-def _extract_max_count(args: List[str], default_n: int) -> int:
-    n = default_n
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == "-n" and i + 1 < len(args):
-            try:
-                n = int(args[i + 1])
-            except ValueError:
-                pass
-            i += 2
+def _user_color_choice(git_args: List[str]) -> Optional[str]:
+    # explicit overrides only
+    for a in git_args:
+        if a in ("--color=always", "--color=never", "--color=auto"):
+            return a.split("=", 1)[1]
+        if a == "--color":  # rarely used like "--color always"
+            # argparse-like form; we won't parse the next token here
+            return None
+    return None
+
+
+def _color_arg_for_captured(git_args: List[str]) -> str:
+    """
+    Mimic git's --color=auto semantics for *captured* stdout (PIPE):
+      - if user says --color=never -> never
+      - else if stdout is a tty -> always
+      - else -> never
+    """
+    choice = _user_color_choice(git_args)
+    if choice == "never":
+        return "--color=never"
+    if choice == "always":
+        return "--color=always"
+    # auto or unspecified
+    return "--color=always" if sys.stdout.isatty() else "--color=never"
+
+
+def _extract_decorate_arg(git_args: List[str]) -> Optional[str]:
+    decorate = None
+    for a in git_args:
+        if a == "--decorate" or a.startswith("--decorate="):
+            decorate = a
+        if a == "--no-decorate":
+            decorate = "--decorate=no"
+    return decorate
+
+
+def _drop_color_args(args: List[str]) -> List[str]:
+    out: List[str] = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
             continue
-        if a.startswith("-n") and len(a) > 2:
-            try:
-                n = int(a[2:])
-            except ValueError:
-                pass
-            i += 1
+        if a == "--color":
+            skip_next = True
             continue
-        if a == "--max-count" and i + 1 < len(args):
-            try:
-                n = int(args[i + 1])
-            except ValueError:
-                pass
-            i += 2
+        if a.startswith("--color="):
             continue
-        if a.startswith("--max-count="):
+        out.append(a)
+    return out
+
+
+def _drop_graph_args(args: List[str]) -> List[str]:
+    return [a for a in args if a != "--graph" and not a.startswith("--graph=")]
+
+
+def _extract_abbrev_len(git_args: List[str]) -> int:
+    if "--no-abbrev-commit" in git_args:
+        return 40
+    for a in git_args:
+        if a.startswith("--abbrev="):
             try:
                 n = int(a.split("=", 1)[1])
+                return max(1, min(40, n))
             except ValueError:
                 pass
-            i += 1
-            continue
-        if a.startswith("-") and len(a) > 1 and a[1:].isdigit():  # git shorthand -20
-            try:
-                n = int(a[1:])
-            except ValueError:
-                pass
-            i += 1
-            continue
-        i += 1
-    return max(1, n)
+    return 7 if "--oneline" in git_args else 10
 
 
-def _has_order_flag(args: List[str]) -> bool:
-    return any(a in _ORDER_FLAGS for a in args)
+def _has_any_pretty(git_args: List[str]) -> bool:
+    return any(
+        a == "--oneline"
+        or a.startswith("--pretty")
+        or a.startswith("--format")
+        or a in ("--abbrev-commit", "--no-abbrev-commit")
+        for a in git_args
+    )
 
 
-def _pick_output_mode(git_args: List[str]) -> Tuple[bool, bool]:
-    # Follow "last one wins" behavior if user passed both.
-    mode = None
-    for a in git_args:
-        if a == "--name-only":
-            mode = "name-only"
-        elif a == "--name-status":
-            mode = "name-status"
-    return (mode == "name-only"), (mode == "name-status")
-
-
-def _partition_args_for_tree_mode(git_args: List[str]) -> Tuple[List[str], List[str]]:
+def _pretty_passthrough_args(git_args: List[str]) -> List[str]:
     """
-    Returns:
-      log_args: raw passthrough args suitable for `git log` commit-listing (no diff output)
-      diff_args: raw passthrough args suitable for `git diff`/`git diff-tree`
+    Keep only commit-line formatting args that `git show -s` understands and that
+    affect what user expects to see in `git log`.
     """
-    log_args: List[str] = []
-    diff_args: List[str] = []
-
+    keep_prefixes = (
+        "--pretty",
+        "--format",
+        "--date=",
+        "--abbrev=",
+        "--decorate",
+        "--no-decorate",
+    )
+    keep_exact = {
+        "--oneline",
+        "--abbrev-commit",
+        "--no-abbrev-commit",
+    }
+    out: List[str] = []
     for a in git_args:
-        if _is_diffish(a):
-            diff_args.append(a)
+        if a in keep_exact:
+            out.append(a)
             continue
-        log_args.append(a)
+        if any(a.startswith(p) for p in keep_prefixes):
+            out.append(a)
+            continue
+    return out
 
-    # Also remove name-only/name-status from diff_args; we control those per command.
-    diff_args = [a for a in diff_args if a not in ("--name-only", "--name-status")]
-    return log_args, diff_args
+
+# ---------------------------- ANSI helpers ----------------------------
+
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 
-# ------------------------- graph builder -------------------------
+def _strip_ansi(s: str) -> str:
+    return _ANSI_CSI_RE.sub("", s)
+
+
+# ---------------------------- touch-tip synthetic decoration ----------------------------
+
+
+def _prefer_local_over_remote(refs: List[str], local_branches: Set[str]) -> List[str]:
+    out: List[str] = []
+    for r in refs:
+        if "/" in r:
+            _, tail = r.split("/", 1)
+            if tail in local_branches:
+                continue
+        out.append(r)
+    return out
+
+
+def _format_synthetic_decorations(
+    *,
+    sha: str,
+    head_tip: str,
+    head_branch: str,
+    touch_refs: List[str],
+    touch_tags: List[str],
+    supercompact: bool,
+    local_branches: Set[str],
+) -> str:
+    parts: List[str] = []
+    if sha == head_tip and head_branch and head_branch != "HEAD":
+        parts.append(f"HEAD -> {head_branch}")
+
+    refs = touch_refs
+    if supercompact:
+        refs = _prefer_local_over_remote(refs, local_branches)
+    parts.extend(refs)
+
+    # supercompact: tags don't affect tree shape and are typically too noisy
+    if not supercompact:
+        parts.extend([f"tag: {t}" for t in touch_tags])
+
+    return "(" + ", ".join(parts) + ")" if parts else ""
+
+
+def _git_line_has_decoration(line: str) -> bool:
+    """
+    Heuristic: git --decorate puts "(...)" immediately after the hash (or after hash+space).
+    We detect: "<hash> (" in the stripped line.
+    """
+    s = _strip_ansi(line).lstrip()
+    if not s:
+        return False
+    # first token is hash (abbrev or full)
+    parts = s.split(" ", 1)
+    if len(parts) != 2:
+        return False
+    rest = parts[1].lstrip()
+    return rest.startswith("(")
+
+
+def _inject_decoration_into_git_line(line: str, decoration: str) -> str:
+    """
+    Insert "(...)" after the first token (commit hash) if there's no existing decoration.
+    """
+    if not decoration:
+        return line
+    if _git_line_has_decoration(line):
+        return line
+    s = line.lstrip()
+    leading = line[: len(line) - len(s)]
+    parts = s.split(" ", 1)
+    if len(parts) == 1:
+        return f"{leading}{parts[0]} {decoration}"
+    h, rest = parts
+    rest = rest.lstrip()
+    return f"{leading}{h} {decoration} {rest}".rstrip()
+
+
+# ---------------------------- core graph model ----------------------------
+
+
+@dataclass(frozen=True)
+class HistoryGraph:
+    shas: List[str]                      # commits in selection
+    parents: Dict[str, List[str]]        # compressed to nearest-in-set parents
+    children: Dict[str, List[str]]       # derived
+
+    # user-visible commit lines rendered by git itself (may be multi-line)
+    rendered_lines: Dict[str, List[str]]  # sha -> [line0, line1, ...]
+
+    # touch-tip labels (your file-history concept)
+    touch_branch_labels: Dict[str, List[str]]  # sha -> [refname:short]
+    touch_tag_labels: Dict[str, List[str]]     # sha -> [tagname]
+    local_branches: Set[str]
+
+    # HEAD info
+    head_tip: str
+    head_branch: str
+
+    # config-ish
+    abbrev_len: int
+    decorate_requested: bool
+
+
+def _chunked(xs: List[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(xs), n):
+        yield xs[i : i + n]
 
 
 class GraphBuilder:
@@ -229,18 +314,17 @@ class GraphBuilder:
         self,
         *,
         git_log_args: List[str],
+        pretty_args: List[str],
         pathspecs: List[str],
         max_commits: int,
-        include_remotes_in_labels: bool = True,
+        decorate_requested: bool,
+        abbrev_len: int,
+        captured_color_arg: str,
     ) -> HistoryGraph:
         head_branch = self.git.run(["rev-parse", "--abbrev-ref", "HEAD"], timeout_s=30).strip()
         head_tip = self._head_tip(pathspecs)
 
-        rows = self._log_rows(
-            git_log_args=git_log_args,
-            pathspecs=pathspecs,
-            max_commits=max_commits,
-        )
+        rows = self._log_rows(git_log_args=git_log_args, pathspecs=pathspecs, max_commits=max_commits)
         shas = [sha for sha, _ in rows]
         sha_set = set(shas)
 
@@ -251,14 +335,7 @@ class GraphBuilder:
         for sha, direct_parents in rows:
             out: List[str] = []
             for p in direct_parents:
-                out.extend(
-                    self._nearest_in_set(
-                        p,
-                        sha_set=sha_set,
-                        parents_map=parents_map,
-                        cache=nearest_cache,
-                    )
-                )
+                out.extend(self._nearest_in_set(p, sha_set=sha_set, parents_map=parents_map, cache=nearest_cache))
             uniq: List[str] = []
             seen: Set[str] = set()
             for x in out:
@@ -267,24 +344,125 @@ class GraphBuilder:
                     uniq.append(x)
             parents[sha] = uniq
 
-        metas = self._fetch_meta(shas)
+        children: Dict[str, List[str]] = {sha: [] for sha in shas}
+        for child, ps in parents.items():
+            for p in ps:
+                if p in children:
+                    children[p].append(child)
 
-        branch_labels = self._branch_labels(
-            pathspecs,
-            include_locals=True,
-            include_remotes=include_remotes_in_labels,
+        # stable-ish ordering by commit time (via git show)
+        epoch = self._epochs(shas)
+        for p, kids in children.items():
+            kids.sort(key=lambda s: epoch.get(s, 0), reverse=True)
+
+        local_branches = set(self._refs_list(include_locals=True, include_remotes=False))
+        touch_br = self._touch_branch_labels(pathspecs, include_locals=True, include_remotes=True)
+        touch_tags = self._touch_tag_labels(pathspecs)
+
+        rendered_lines = self._render_commit_lines(
+            shas,
+            pretty_args=pretty_args,
+            pathspecs=pathspecs,
+            captured_color_arg=captured_color_arg,
         )
-        tag_labels = self._tag_labels(pathspecs)
 
         return HistoryGraph(
             shas=shas,
             parents=parents,
-            metas=metas,
-            branch_labels=branch_labels,
-            tag_labels=tag_labels,
+            children=children,
+            rendered_lines=rendered_lines,
+            touch_branch_labels=touch_br,
+            touch_tag_labels=touch_tags,
+            local_branches=local_branches,
             head_tip=head_tip,
             head_branch=head_branch,
+            abbrev_len=abbrev_len,
+            decorate_requested=decorate_requested,
         )
+
+    def _epochs(self, shas: List[str]) -> Dict[str, int]:
+        if not shas:
+            return {}
+        fmt = "%H%x1f%ct%x1e"
+        out: Dict[str, int] = {}
+        for chunk in _chunked(list(dict.fromkeys(shas)), 200):
+            txt = self.git.run(["show", "-s", f"--pretty=format:{fmt}", *chunk], timeout_s=240)
+            for rec in txt.split("\x1e"):
+                rec = rec.strip()
+                if not rec:
+                    continue
+                parts = rec.split("\x1f")
+                if len(parts) != 2:
+                    continue
+                sha, ct = parts[0].strip(), parts[1].strip()
+                try:
+                    out[sha] = int(ct)
+                except ValueError:
+                    out[sha] = 0
+        return out
+
+    def _render_commit_lines(
+        self,
+        shas: List[str],
+        *,
+        pretty_args: List[str],
+        pathspecs: List[str],
+        captured_color_arg: str,
+    ) -> Dict[str, List[str]]:
+        """
+        Render each commit using git itself, preserving user's pretty/oneline/decorate output.
+        We record the full output per sha (can be multi-line).
+        """
+        if not shas:
+            return {}
+
+        # Ensure single-line default (match git log --oneline-ish) if user provided no pretty options.
+        pretty = list(pretty_args)
+        if not any(a == "--oneline" or a.startswith("--pretty") or a.startswith("--format") for a in pretty):
+            pretty = ["--oneline", *pretty]
+
+        # Ensure we only get that commit's formatted output (no patch)
+        # Note: `git show -s` prints a trailing newline; we splitlines().
+        out: Dict[str, List[str]] = {}
+        for chunk in _chunked(list(dict.fromkeys(shas)), 100):
+            # Use a record separator between commits so we can map back.
+            # We'll ask git to prepend the full SHA in a hidden field using pretty format,
+            # but only when user did NOT specify their own --pretty/--format.
+            user_pretty = any(a.startswith("--pretty") or a.startswith("--format") for a in pretty_args)
+            if user_pretty:
+                # Can't safely wrap arbitrary user format; do per-commit calls.
+                for sha in chunk:
+                    txt = self.git.run(
+                        ["show", "-s", "--no-patch", captured_color_arg, *pretty, sha],
+                        timeout_s=240,
+                    )
+                    lines = [ln.rstrip("\n") for ln in txt.splitlines() if ln.strip() != ""]
+                    out[sha] = lines if lines else [sha[:10]]
+                continue
+
+            # Safe path: we control the format: emit "<SHA><US><USER_OUTPUT><RS>"
+            RS = "\x1e"
+            US = "\x1f"
+            # user output: oneline-ish by default; allow decorate etc via pretty args
+            # We'll approximate oneline with: "%h %d %s" if user passed --oneline (git will do it)
+            # so we simply use the pretty args and let git format.
+            fmt = f"%H{US}%h %d %s{RS}"
+            txt = self.git.run(
+                ["show", "-s", "--no-patch", captured_color_arg, f"--pretty=format:{fmt}", *[a for a in pretty if a != "--oneline"], *chunk],
+                timeout_s=240,
+            )
+            for rec in txt.split(RS):
+                rec = rec.strip()
+                if not rec:
+                    continue
+                if US not in rec:
+                    continue
+                sha, line = rec.split(US, 1)
+                sha = sha.strip()
+                line = line.rstrip("\n")
+                out[sha] = [line]
+
+        return out
 
     def _head_tip(self, pathspecs: List[str]) -> str:
         if not pathspecs:
@@ -292,28 +470,10 @@ class GraphBuilder:
         out = self.git.run(["log", "-n", "1", "--pretty=format:%H", "HEAD", "--", *pathspecs], timeout_s=120).strip()
         return out.splitlines()[0].strip() if out else ""
 
-    def _log_rows(
-        self,
-        *,
-        git_log_args: List[str],
-        pathspecs: List[str],
-        max_commits: int,
-    ) -> List[Tuple[str, List[str]]]:
-        # Force parseable output. Ensure no diff output is printed.
-        cmd = [
-            "log",
-            *git_log_args,
-        ]
-        if not _has_order_flag(git_log_args):
-            cmd.append("--topo-order")
-        cmd += [
-            f"-n{max_commits}",
-            "--no-patch",
-            "--pretty=format:%H %P",
-        ]
+    def _log_rows(self, *, git_log_args: List[str], pathspecs: List[str], max_commits: int) -> List[Tuple[str, List[str]]]:
+        cmd = ["log", *git_log_args, "--topo-order", f"-n{max_commits}", "--no-patch", "--pretty=format:%H %P"]
         if pathspecs:
             cmd += ["--", *pathspecs]
-
         out = self.git.run(cmd, timeout_s=240)
         rows: List[Tuple[str, List[str]]] = []
         for ln in out.splitlines():
@@ -390,36 +550,8 @@ class GraphBuilder:
             if x not in seen:
                 seen.add(x)
                 uniq.append(x)
-
         cache[start_sha] = uniq
         return uniq
-
-    def _fetch_meta(self, shas: List[str]) -> Dict[str, CommitMeta]:
-        if not shas:
-            return {}
-        fmt = "%H%x1f%an%x1f%ad%x1f%ct%x1f%s%x1e"
-        metas: Dict[str, CommitMeta] = {}
-        for chunk in self._chunked(list(dict.fromkeys(shas)), 200):
-            out = self.git.run(
-                ["show", "-s", "--date=iso-strict", f"--pretty=format:{fmt}", *chunk],
-                timeout_s=240,
-            )
-            for rec in out.split("\x1e"):
-                rec = rec.strip()
-                if not rec:
-                    continue
-                parts = rec.split("\x1f")
-                if len(parts) != 5:
-                    continue
-                sha, author, date_iso, epoch_s, subject = (p.strip() for p in parts)
-                metas[sha] = CommitMeta(
-                    sha=sha,
-                    author=author,
-                    date_iso=date_iso,
-                    subject=subject,
-                    epoch=int(epoch_s),
-                )
-        return metas
 
     def _refs_list(self, *, include_locals: bool, include_remotes: bool) -> List[str]:
         refs: List[str] = []
@@ -441,23 +573,23 @@ class GraphBuilder:
         out = self.git.run(["log", "-n", "1", "--pretty=format:%H", ref, "--", *pathspecs], timeout_s=120).strip()
         return out.splitlines()[0].strip() if out else ""
 
-    def _branch_labels(
+    def _touch_branch_labels(
         self,
         pathspecs: List[str],
         *,
         include_locals: bool,
         include_remotes: bool,
     ) -> Dict[str, List[str]]:
-        commit_to_branches: Dict[str, List[str]] = {}
-        for b in self._refs_list(include_locals=include_locals, include_remotes=include_remotes):
-            tip = self._tip_sha(b, pathspecs)
+        commit_to_refs: Dict[str, List[str]] = {}
+        for ref in self._refs_list(include_locals=include_locals, include_remotes=include_remotes):
+            tip = self._tip_sha(ref, pathspecs)
             if tip:
-                commit_to_branches.setdefault(tip, []).append(b)
-        for sha in commit_to_branches:
-            commit_to_branches[sha].sort(key=str.casefold)
-        return commit_to_branches
+                commit_to_refs.setdefault(tip, []).append(ref)
+        for sha in commit_to_refs:
+            commit_to_refs[sha].sort(key=str.casefold)
+        return commit_to_refs
 
-    def _tag_labels(self, pathspecs: List[str]) -> Dict[str, List[str]]:
+    def _touch_tag_labels(self, pathspecs: List[str]) -> Dict[str, List[str]]:
         tags_out = self.git.run(["tag", "--list"], timeout_s=120)
         tags = [t.strip() for t in tags_out.splitlines() if t.strip()]
         commit_to_tags: Dict[str, List[str]] = {}
@@ -469,26 +601,11 @@ class GraphBuilder:
             commit_to_tags[sha].sort(key=str.casefold)
         return commit_to_tags
 
-    @staticmethod
-    def _chunked(xs: List[str], n: int) -> Iterable[List[str]]:
-        for i in range(0, len(xs), n):
-            yield xs[i : i + n]
 
-
-# ------------------------- touched files provider (diff passthrough) -------------------------
+# ---------------------------- touched files (optional) ----------------------------
 
 
 class EdgeTouchedFiles:
-    """
-    Compute touched files for a node by comparing it with its *visible parent*.
-
-    Root node:
-      git diff-tree --root -r --name-status <sha> <diff_args...> -- <pathspec...>
-
-    Edge parent->node:
-      git diff --name-status <parent> <sha> <diff_args...> -- <pathspec...>
-    """
-
     def __init__(self, git: Git, pathspecs: List[str], diff_args: List[str]) -> None:
         self.git = git
         self.pathspecs = pathspecs
@@ -501,23 +618,9 @@ class EdgeTouchedFiles:
             return self._cache[key]
 
         if parent_sha:
-            cmd = [
-                "diff",
-                *self.diff_args,
-                "--name-status" if name_status else "--name-only",
-                parent_sha,
-                sha,
-            ]
+            cmd = ["diff", *self.diff_args, "--name-status" if name_status else "--name-only", parent_sha, sha]
         else:
-            cmd = [
-                "diff-tree",
-                "--root",
-                "-r",
-                "--no-commit-id",
-                *self.diff_args,
-                "--name-status" if name_status else "--name-only",
-                sha,
-            ]
+            cmd = ["diff-tree", "--root", "-r", "--no-commit-id", *self.diff_args, "--name-status" if name_status else "--name-only", sha]
 
         if self.pathspecs:
             cmd += ["--", *self.pathspecs]
@@ -528,7 +631,26 @@ class EdgeTouchedFiles:
         return lines
 
 
-# ------------------------- printing -------------------------
+def _partition_args_for_tree_mode(git_args: List[str]) -> Tuple[List[str], List[str], bool]:
+    """
+    Return (log_args, diff_args, show_files)
+    Only support --name-only/--name-status; other args pass to log (except formatting args handled separately).
+    """
+    name_only = "--name-only" in git_args
+    name_status = "--name-status" in git_args
+    diff_args: List[str] = []
+    log_args: List[str] = []
+    for a in git_args:
+        if a in ("--name-only", "--name-status"):
+            continue
+        if a.startswith("--diff-filter=") or a.startswith("--find-renames") or a.startswith("--find-copies") or a.startswith("--unified=") or a.startswith("-U") or a in ("-M", "-C", "--no-renames"):
+            diff_args.append(a)
+        else:
+            log_args.append(a)
+    return log_args, diff_args, bool(name_status or name_only)
+
+
+# ---------------------------- tree rendering ----------------------------
 
 
 @dataclass(frozen=True)
@@ -539,7 +661,7 @@ class TreeStyle:
     space: str
 
     @staticmethod
-    def unicode() -> "TreeStyle":
+    def box() -> "TreeStyle":
         return TreeStyle(tee="├─ ", elbow="└─ ", vert="│   ", space="    ")
 
     @staticmethod
@@ -556,8 +678,8 @@ class TreePrinter:
         compact: bool,
         supercompact: bool,
         touched: Optional[EdgeTouchedFiles],
-        show_name_only: bool,
-        show_name_status: bool,
+        show_files: bool,
+        name_status: bool,
         max_files: int,
     ) -> None:
         self.g = g
@@ -565,128 +687,103 @@ class TreePrinter:
         self.compact = bool(compact or supercompact)
         self.supercompact = bool(supercompact)
         self.touched = touched
-        self.show_name_only = show_name_only
-        self.show_name_status = show_name_status
+        self.show_files = bool(show_files)
+        self.name_status = bool(name_status)
         self.max_files = max(0, int(max_files))
 
-    def print(self) -> None:
-        g = self.g
-        if not g.shas:
-            print("No commits in selection.")
-            return
+    def _is_leaf(self, sha: str) -> bool:
+        return len(self.g.children.get(sha, [])) == 0
 
-        children_of: Dict[str, List[str]] = {sha: [] for sha in g.shas}
-        roots: List[str] = []
+    def _is_branch_point(self, sha: str) -> bool:
+        return len(self.g.children.get(sha, [])) >= 2
 
-        for child in g.shas:
-            ps = g.parents.get(child, [])
-            if not ps:
-                roots.append(child)
-            for p in ps:
-                if p in children_of:
-                    children_of[p].append(child)
-
-        epoch = {sha: g.metas.get(sha).epoch if sha in g.metas else 0 for sha in g.shas}
-        for p, kids in children_of.items():
-            kids.sort(key=lambda s: epoch.get(s, 0), reverse=True)
-
-        roots_sorted = sorted(roots, key=lambda s: epoch.get(s, 0))
-        primary_root = roots_sorted[0]
-
-        if g.head_tip and g.head_tip in set(g.shas):
-            cur = g.head_tip
-            seen: Set[str] = set()
-            while True:
-                if cur in seen:
-                    break
-                seen.add(cur)
-                ps = g.parents.get(cur, [])
-                if not ps:
-                    primary_root = cur
-                    break
-                cur = min(ps, key=lambda x: epoch.get(x, 0))
-
-        roots_ordered = [primary_root] + [r for r in roots_sorted if r != primary_root]
-        self._walk_forest(roots_ordered, children_of)
-
-    def _is_key_decorated(self, sha: str) -> bool:
-        g = self.g
-        if sha == g.head_tip:
+    def _is_key_node(self, sha: str, roots: Set[str]) -> bool:
+        if sha in roots:
             return True
-        if sha in g.branch_labels:
+        if self._is_leaf(sha):
             return True
-        if not self.supercompact and sha in g.tag_labels:
+        if self._is_branch_point(sha):
+            return True
+        if sha == self.g.head_tip:
+            return True
+        if sha in self.g.touch_branch_labels:
+            return True
+        if (not self.supercompact) and sha in self.g.touch_tag_labels:
             return True
         return False
 
-    def _is_key_node(self, sha: str, children_of: Dict[str, List[str]], roots: Set[str]) -> bool:
-        if sha in roots:
-            return True
-        if self._is_key_decorated(sha):
-            return True
-        return len(children_of.get(sha, [])) >= 2
+    def _compress_chain(self, start: str, roots: Set[str]) -> str:
+        if not self.compact:
+            return start
+        cur = start
+        while True:
+            if self._is_key_node(cur, roots):
+                return cur
+            kids = self.g.children.get(cur, [])
+            if len(kids) != 1:
+                return cur
+            cur = kids[0]
 
-    def _fmt_commit(self, sha: str) -> str:
+    def _fmt_commit_lines(self, sha: str) -> List[str]:
         g = self.g
-        m = g.metas.get(sha)
-        short = sha[:10]
-        date = (m.date_iso[:10] if m and m.date_iso else "")
-        subj = (m.subject if m else "")
+        base = g.rendered_lines.get(sha) or [sha[: g.abbrev_len]]
 
-        pre: List[str] = []
-        if sha == g.head_tip:
-            pre.append("HEAD")
-        bs = ", ".join(g.branch_labels.get(sha, []))
-        if bs:
-            pre.append(bs)
-        ts = ", ".join(g.tag_labels.get(sha, []))
-        if ts:
-            pre.append(f"tags:{ts}")
+        # Inject synthetic touch-tip decoration ONLY if git produced no "(...)" on line0.
+        touch_refs = g.touch_branch_labels.get(sha, [])
+        touch_tags = g.touch_tag_labels.get(sha, [])
+        syn = _format_synthetic_decorations(
+            sha=sha,
+            head_tip=g.head_tip,
+            head_branch=g.head_branch,
+            touch_refs=touch_refs,
+            touch_tags=touch_tags,
+            supercompact=self.supercompact,
+            local_branches=g.local_branches,
+        )
+        if syn and not _git_line_has_decoration(base[0]):
+            base = [_inject_decoration_into_git_line(base[0], syn), *base[1:]]
+        return base
 
-        prefix = f"[{' | '.join(pre)}] " if pre else ""
-        return f"{prefix}{short}  {date}  {subj}".rstrip()
+    def render(self) -> str:
+        g = self.g
+        if not g.shas:
+            return "No commits in selection.\n"
 
-    def _walk_forest(self, roots: List[str], children_of: Dict[str, List[str]]) -> None:
-        show_files = (self.show_name_only or self.show_name_status) and (self.touched is not None)
-        name_status = self.show_name_status
+        roots: List[str] = [sha for sha in g.shas if not g.parents.get(sha)]
+        # show older roots first
+        roots.reverse()
         roots_set = set(roots)
 
-        def compress_chain(start: str) -> str:
-            if not self.compact:
-                return start
-            cur = start
-            while True:
-                if self._is_key_node(cur, children_of, roots=roots_set):
-                    return cur
-                kids = children_of.get(cur, [])
-                if len(kids) != 1:
-                    return cur
-                cur = kids[0]
+        out: List[str] = []
 
         def print_files(prefix: str, sha: str, parent_sha: Optional[str]) -> None:
-            if not show_files:
+            if not (self.show_files and self.touched):
                 return
-            lines = self.touched.get(sha, parent_sha=parent_sha, name_status=name_status)
-
+            lines = self.touched.get(sha, parent_sha=parent_sha, name_status=self.name_status)
             if self.max_files and len(lines) > self.max_files:
                 shown = lines[: self.max_files]
                 more = len(lines) - self.max_files
             else:
                 shown = lines
                 more = 0
-
             for ln in shown:
-                print(f"{prefix}· {ln}")
+                out.append(f"{prefix}· {ln}\n")
             if more:
-                print(f"{prefix}· ... ({more} more)")
+                out.append(f"{prefix}· ... ({more} more)\n")
 
         def walk(node: str, *, prefix: str, is_last: bool, path: Set[str], visible_parent: Optional[str]) -> None:
             conn = self.style.elbow if is_last else self.style.tee
-            line = self._fmt_commit(node)
+            lines = self._fmt_commit_lines(node)
+
             if prefix:
-                print(f"{prefix}{conn}{line}")
+                out.append(f"{prefix}{conn}{lines[0]}\n")
             else:
-                print(line)
+                out.append(f"{lines[0]}\n")
+
+            if len(lines) > 1:
+                cont_prefix = prefix + (self.style.space if is_last else self.style.vert)
+                for extra in lines[1:]:
+                    out.append(f"{cont_prefix}{extra}\n")
 
             if node in path:
                 return
@@ -696,107 +793,223 @@ class TreePrinter:
             child_prefix = prefix + (self.style.space if is_last else self.style.vert)
             print_files(child_prefix, node, visible_parent)
 
-            kids = children_of.get(node, [])
+            kids = g.children.get(node, [])
             if not kids:
                 return
 
-            ends: List[str] = []
-            seen_end: Set[str] = set()
+            nexts: List[str] = []
+            seen: Set[str] = set()
             for k in kids:
-                end = compress_chain(k)
-                if end not in seen_end:
-                    seen_end.add(end)
-                    ends.append(end)
+                end = self._compress_chain(k, roots_set)
+                if end not in seen:
+                    seen.add(end)
+                    nexts.append(end)
 
-            for i, end in enumerate(ends):
-                walk(
-                    end,
-                    prefix=child_prefix,
-                    is_last=(i == len(ends) - 1),
-                    path=path2,
-                    visible_parent=node,
-                )
+            for i, ch in enumerate(nexts):
+                walk(ch, prefix=child_prefix, is_last=(i == len(nexts) - 1), path=path2, visible_parent=node)
 
         for i, r in enumerate(roots):
             walk(r, prefix="", is_last=(i == len(roots) - 1), path=set(), visible_parent=None)
 
+        return "".join(out)
 
-# ------------------------- CLI -------------------------
+
+# ---------------------------- dag glyph conversion (keep rest colors) ----------------------------
+
+_GRAPH_CHARS = set(r"|/\*_. -<>o=^+-")
+_WIRE_MAP_DAG = str.maketrans({"|": "│", "/": "╱", "\\": "╲", "_": "─", "-": "─", ".": "·"})
+_MERGE_ASCII = "|\\ "
+_FORK_ASCII = "|/ "
+_MERGE_BOX = "├─┐"
+_FORK_BOX = "├─┘"
+
+
+def _split_prefix_ansi_aware(line: str) -> Tuple[str, str]:
+    i = 0
+    n = len(line)
+    while i < n:
+        m = _ANSI_CSI_RE.match(line, i)
+        if m:
+            i = m.end()
+            continue
+        if line[i] in _GRAPH_CHARS:
+            i += 1
+            continue
+        break
+    return line[:i], line[i:]
+
+
+def _is_graph_only(prefix_plain: str, rest: str) -> bool:
+    return rest.strip() == "" and prefix_plain.strip() != "" and "*" not in prefix_plain
+
+
+def _find_overlays(prefix_plain: str) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]]]:
+    prev: List[Tuple[int, str]] = []
+    nxt: List[Tuple[int, str]] = []
+
+    start = 0
+    while True:
+        p = prefix_plain.find(_FORK_ASCII, start)
+        if p < 0:
+            break
+        prev.append((p, _FORK_BOX))
+        start = p + 1
+
+    start = 0
+    while True:
+        p = prefix_plain.find(_MERGE_ASCII, start)
+        if p < 0:
+            break
+        nxt.append((p, _MERGE_BOX))
+        start = p + 1
+
+    return prev, nxt
+
+
+def _rewrite_commit_prefix(prefix_plain: str, overlays: List[Tuple[int, str]]) -> str:
+    vis = prefix_plain.translate(_WIRE_MAP_DAG)
+    i = vis.find("*")
+    if i >= 0:
+        vis = vis[:i] + "∙" + vis[i + 1 :]
+    chars = list(vis)
+    for pos, repl in overlays:
+        if 0 <= pos and pos + 3 <= len(chars):
+            chars[pos : pos + 3] = list(repl)
+    return "".join(chars)
+
+
+@dataclass
+class _DagBuf:
+    prefix_plain: str
+    rest: str
+    overlays: List[Tuple[int, str]]
+
+
+def graph_box_glyphs_keep_rest_colors(text: str) -> str:
+    out: List[str] = []
+    buf: Optional[_DagBuf] = None
+    pending_for_next: List[Tuple[int, str]] = []
+    pending_for_prev: List[Tuple[int, str]] = []
+
+    for line in text.splitlines(True):
+        prefix, rest = _split_prefix_ansi_aware(line)
+        prefix_plain = _strip_ansi(prefix)
+
+        if _is_graph_only(prefix_plain, rest.strip("\n")):
+            prev, nxt = _find_overlays(prefix_plain)
+            pending_for_prev.extend(prev)
+            pending_for_next.extend(nxt)
+            continue
+
+        if buf is not None:
+            buf.overlays.extend(pending_for_prev)
+            pending_for_prev = []
+            out.append(_rewrite_commit_prefix(buf.prefix_plain, buf.overlays) + buf.rest)
+            buf = None
+
+        buf = _DagBuf(prefix_plain=prefix_plain, rest=rest, overlays=list(pending_for_next))
+        pending_for_next = []
+
+    if buf is not None:
+        buf.overlays.extend(pending_for_prev)
+        out.append(_rewrite_commit_prefix(buf.prefix_plain, buf.overlays) + buf.rest)
+
+    return "".join(out)
+
+
+# ---------------------------- CLI ----------------------------
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(add_help=True)
+    ap = argparse.ArgumentParser(add_help=True, allow_abbrev=False)
     ap.add_argument("-C", dest="C", default=".", help="run as if started in <path>")
-    ap.add_argument("--graph", default="tree", choices=["tree", "dag"])
-    ap.add_argument("--graph-style", default="unicode", choices=["unicode", "ascii"])
+    ap.add_argument("--view", choices=["tree", "dag"], default="tree")
+    ap.add_argument("--graph-glyphs", choices=["ascii", "box"], default="ascii", help="Only affects --view=dag when --graph is used.")
     ap.add_argument("--compact", action="store_true")
     ap.add_argument("--supercompact", action="store_true")
     ap.add_argument("--max-files", type=int, default=0, help="0=unlimited")
-    ns, rest = ap.parse_known_args()
+    ap.add_argument("--tree-style", choices=["box", "ascii"], default="box")
 
+    ns, rest = ap.parse_known_args()
     git_args, pathspecs = _split_git_and_pathspec(rest)
+
+    repo = Path(ns.C).expanduser().resolve()
+    git = Git(repo)
+
     pathspecs = [p.replace("\\", "/") for p in pathspecs]
 
-    show_name_only, show_name_status = _pick_output_mode(git_args)
+    captured_color_arg = _color_arg_for_captured(git_args)
+    decorate_arg = _extract_decorate_arg(git_args)
+    decorate_requested = bool(decorate_arg and decorate_arg != "--decorate=no")
+    abbrev_len = _extract_abbrev_len(git_args)
 
-    cwd = Path(ns.C).expanduser().resolve()
-    git = Git(cwd)
-    repo = git.toplevel()
+    if ns.view == "dag":
+        # passthrough unless we rewrite glyphs
+        if ns.graph_glyphs == "box" and _contains_git_graph_arg(git_args):
+            git_args2 = _drop_color_args(git_args)
+            cmd = ["--no-pager", "log", captured_color_arg, *git_args2]
+            if pathspecs:
+                cmd += ["--", *pathspecs]
+            out = git.run(cmd, timeout_s=600)
+            out = graph_box_glyphs_keep_rest_colors(out)
+            sys.stdout.write(out)
+            return
 
-    if ns.graph == "dag":
-        # Pure passthrough to git log (your args define everything).
         cmd = ["log", *git_args]
         if pathspecs:
             cmd += ["--", *pathspecs]
-        print(f"Repo: {repo}")
-        print(f"Args: {' '.join(git_args) if git_args else '(none)'}")
-        print(f"Pathspec: {pathspecs if pathspecs else '(none)'}")
-        print()
         git.run_passthru(cmd)
         return
 
-    # Tree mode:
-    log_args, diff_args = _partition_args_for_tree_mode(git_args)
+    # tree view
+    if _contains_git_graph_arg(git_args):
+        raise RuntimeError("git-tree: use --view=dag for git's --graph")
 
-    # If user didn't request touch output, don't run diffs.
-    touched = None
-    if show_name_only or show_name_status:
-        touched = EdgeTouchedFiles(git, pathspecs, diff_args=diff_args)
+    # allow --name-only / --name-status to work (optional)
+    log_args, diff_args, show_files = _partition_args_for_tree_mode(git_args)
+    name_status = "--name-status" in git_args
+    touched = EdgeTouchedFiles(git, pathspecs, diff_args) if show_files else None
 
-    max_commits = _extract_max_count(git_args, default_n=2000)
+    # tree building should not inherit pretty/format flags (we render separately)
+    log_args = [a for a in _drop_color_args(_drop_graph_args(log_args)) if not (a == "--oneline" or a.startswith("--pretty") or a.startswith("--format") or a.startswith("--date=") or a.startswith("--abbrev=") or a in ("--abbrev-commit", "--no-abbrev-commit") or a.startswith("--decorate") or a == "--no-decorate")]
+
+    pretty_args = _pretty_passthrough_args(git_args)
+
+    max_commits = 2000
+    for i, a in enumerate(git_args):
+        if a == "-n" and i + 1 < len(git_args):
+            try:
+                max_commits = int(git_args[i + 1])
+            except ValueError:
+                pass
+        if a.startswith("--max-count="):
+            try:
+                max_commits = int(a.split("=", 1)[1])
+            except ValueError:
+                pass
 
     g = GraphBuilder(git).build(
         git_log_args=log_args,
+        pretty_args=pretty_args,
         pathspecs=pathspecs,
-        max_commits=max_commits,
-        include_remotes_in_labels=True,
+        max_commits=max(1, int(max_commits)),
+        decorate_requested=decorate_requested,
+        abbrev_len=abbrev_len,
+        captured_color_arg=captured_color_arg,
     )
 
-    style = TreeStyle.unicode() if ns.graph_style == "unicode" else TreeStyle.ascii()
-
-    print(f"Repo: {repo}")
-    print(f"Args: {' '.join(git_args) if git_args else '(none)'}")
-    print(f"Pathspec: {pathspecs if pathspecs else '(none)'}")
-    print(f"HEAD branch: {g.head_branch}")
-    print(f"Commits: {len(g.shas)}")
-    if ns.supercompact:
-        print("Mode: supercompact (tags do not affect tree shape)")
-    elif ns.compact:
-        print("Mode: compact")
-    if diff_args:
-        print(f"Diff args (passthrough): {' '.join(diff_args)}")
-    print()
-
-    TreePrinter(
+    style = TreeStyle.ascii() if ns.tree_style == "ascii" else TreeStyle.box()
+    text = TreePrinter(
         g,
         style=style,
         compact=ns.compact,
         supercompact=ns.supercompact,
         touched=touched,
-        show_name_only=show_name_only,
-        show_name_status=show_name_status,
+        show_files=show_files,
+        name_status=name_status,
         max_files=ns.max_files,
-    ).print()
+    ).render()
+    sys.stdout.write(text)
 
 
 if __name__ == "__main__":
