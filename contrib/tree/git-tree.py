@@ -919,21 +919,19 @@ def graph_box_glyphs_keep_rest_colors(text: str) -> str:
 
 # ---------------------------- CLI ----------------------------
 
-
-def main() -> None:
-    ap = argparse.ArgumentParser(add_help=True, allow_abbrev=False)
-    ap.add_argument("-C", dest="C", default=".", help="run as if started in <path>")
-    ap.add_argument("--view", choices=["tree", "dag"], default="tree")
-    ap.add_argument("--graph-glyphs", choices=["ascii", "box"], default="ascii", help="Only affects --view=dag when --graph is used.")
-    ap.add_argument("--compact", action="store_true")
-    ap.add_argument("--supercompact", action="store_true")
-    ap.add_argument("--max-files", type=int, default=0, help="0=unlimited")
-    ap.add_argument("--tree-style", choices=["box", "ascii"], default="box")
-
-    ns, rest = ap.parse_known_args()
-    git_args, pathspecs = _split_git_and_pathspec(rest)
-
-    repo = Path(ns.C).expanduser().resolve()
+def _run(
+    *,
+    repo: Path,
+    view: str,
+    graph_glyphs: str,
+    tree_style: str,
+    compact: bool,
+    supercompact: bool,
+    max_files: int,
+    git_args: List[str],
+    pathspecs: List[str],
+) -> None:
+    repo = repo.expanduser().resolve()
     git = Git(repo)
 
     pathspecs = [p.replace("\\", "/") for p in pathspecs]
@@ -943,9 +941,9 @@ def main() -> None:
     decorate_requested = bool(decorate_arg and decorate_arg != "--decorate=no")
     abbrev_len = _extract_abbrev_len(git_args)
 
-    if ns.view == "dag":
+    if view == "dag":
         # passthrough unless we rewrite glyphs
-        if ns.graph_glyphs == "box" and _contains_git_graph_arg(git_args):
+        if graph_glyphs == "box" and _contains_git_graph_arg(git_args):
             git_args2 = _drop_color_args(git_args)
             cmd = ["--no-pager", "log", captured_color_arg, *git_args2]
             if pathspecs:
@@ -998,19 +996,318 @@ def main() -> None:
         captured_color_arg=captured_color_arg,
     )
 
-    style = TreeStyle.ascii() if ns.tree_style == "ascii" else TreeStyle.box()
+    style = TreeStyle.ascii() if tree_style == "ascii" else TreeStyle.box()
     text = TreePrinter(
         g,
         style=style,
-        compact=ns.compact,
-        supercompact=ns.supercompact,
+        compact=compact,
+        supercompact=supercompact,
         touched=touched,
         show_files=show_files,
         name_status=name_status,
-        max_files=ns.max_files,
+        max_files=max_files,
     ).render()
     sys.stdout.write(text)
 
+# -------------------------
+# Typer CLI (prototype)
+# -------------------------
+
+from dataclasses import field
+import typer
+
+app = typer.Typer(
+    add_completion=False,
+    pretty_exceptions_enable=False,
+    pretty_exceptions_show_locals=False,
+)
+
+CLASSES = {"graph", "tree", "refs", "reversed"}
+MODES = {"auto", "on", "off"}
+
+
+@dataclass
+class DecoratorSpec:
+    kind: str
+    mode: str = "auto"
+    style: Optional[str] = None
+    color: str = "auto"
+    extras: List[str] = field(default_factory=list)
+
+
+def parse_spec_list(value: str) -> List[DecoratorSpec]:
+    """
+    Parse:  spec-list := spec (',' spec)*
+            spec      := CLASS (':' field)*
+            field     := VALUE | KEY '=' VALUE
+    """
+    specs: List[DecoratorSpec] = []
+    for raw_spec in [s.strip() for s in value.split(",") if s.strip()]:
+        parts = [p.strip() for p in raw_spec.split(":") if p.strip()]
+        if not parts:
+            continue
+
+        kind = parts[0]
+        if kind not in CLASSES:
+            raise typer.BadParameter(
+                f"Unknown decorator class '{kind}'. Expected one of {sorted(CLASSES)}"
+            )
+
+        spec = DecoratorSpec(kind=kind)
+
+        positional: List[str] = []
+        for field_ in parts[1:]:
+            if "=" in field_:
+                k, v = field_.split("=", 1)
+                k = k.strip()
+                v = v.strip()
+                if k == "mode":
+                    spec.mode = v
+                elif k == "style":
+                    spec.style = v
+                elif k == "color":
+                    spec.color = v
+                else:
+                    spec.extras.append(f"{k}={v}")
+            else:
+                positional.append(field_)
+
+        if positional:
+            if spec.mode == "auto" and positional and positional[0] in MODES:
+                spec.mode = positional.pop(0)
+
+            if positional:
+                spec.style = positional.pop(0)
+
+            if positional and positional[0] in MODES:
+                spec.color = positional.pop(0)
+
+            spec.extras.extend(positional)
+
+        if spec.mode not in MODES:
+            raise typer.BadParameter(f"{kind}: invalid mode '{spec.mode}' (expected auto|on|off)")
+        if spec.color not in MODES:
+            raise typer.BadParameter(f"{kind}: invalid color '{spec.color}' (expected auto|on|off)")
+
+        specs.append(spec)
+
+    return specs
+
+
+def _merge_last_wins(specs: List[DecoratorSpec]) -> Dict[str, DecoratorSpec]:
+    final: Dict[str, DecoratorSpec] = {}
+    for s in specs:
+        final[s.kind] = s
+    return final
+
+
+def _ensure_flag(args: List[str], flag: str) -> None:
+    if flag not in args:
+        args.append(flag)
+
+
+def _drop_flags_prefix(args: List[str], *, prefixes: Tuple[str, ...], exact: Tuple[str, ...]) -> List[str]:
+    out: List[str] = []
+    skip_next = False
+    for a in args:
+        if skip_next:
+            skip_next = False
+            continue
+        if a in exact:
+            if a in ("--decorate", "--color"):
+                skip_next = True
+            continue
+        if any(a.startswith(p) for p in prefixes):
+            continue
+        out.append(a)
+    return out
+
+
+def _apply_decorators(
+    final: Dict[str, DecoratorSpec],
+    *,
+    git_args: List[str],
+    default_view: str,
+) -> Tuple[str, str, str, bool, bool, int]:
+    """
+    Returns: (view, graph_glyphs, tree_style, compact, supercompact, max_files)
+
+    Mutates git_args to inject git flags (e.g. --graph, --decorate, --reverse, --color=...).
+    """
+    view = default_view
+    graph_glyphs = "ascii"
+    tree_style = "box"
+    compact = False
+    supercompact = False
+    max_files = 0
+
+    # tree decorator
+    t = final.get("tree")
+    if t and t.mode == "off":
+        view = "dag"
+    elif t and t.mode in ("on", "auto"):
+        view = "tree"
+        if t.style in ("ascii", "box"):
+            tree_style = t.style
+        for x in t.extras:
+            if x == "compact":
+                compact = True
+            elif x == "supercompact":
+                supercompact = True
+            elif x.startswith("max_files="):
+                try:
+                    max_files = int(x.split("=", 1)[1])
+                except ValueError:
+                    pass
+
+    # graph decorator
+    g = final.get("graph")
+    if g and g.mode == "on":
+        view = "dag"
+        if g.style in ("ascii", "box"):
+            graph_glyphs = g.style
+        _ensure_flag(git_args, "--graph")
+
+    # refs decorator -> git --decorate/--no-decorate
+    r = final.get("refs")
+    if r:
+        git_args[:] = _drop_flags_prefix(
+            git_args,
+            prefixes=("--decorate=",),
+            exact=("--decorate", "--no-decorate"),
+        )
+        if r.mode == "off":
+            git_args.append("--no-decorate")
+        elif r.mode in ("on", "auto"):
+            if r.style:
+                git_args.append(f"--decorate={r.style}")
+            else:
+                git_args.append("--decorate")
+
+    # reversed decorator -> git --reverse
+    rv = final.get("reversed")
+    if rv:
+        git_args[:] = [a for a in git_args if a != "--reverse"]
+        if rv.mode == "on":
+            git_args.append("--reverse")
+
+    # color hint (only if user didn't already pass --color)
+    forced_color: Optional[str] = None
+    for s in final.values():
+        if s.color == "on":
+            forced_color = "always"
+        elif s.color == "off":
+            forced_color = "never"
+    if forced_color and _user_color_choice(git_args) is None:
+        git_args.append(f"--color={forced_color}")
+
+    return view, graph_glyphs, tree_style, compact, supercompact, max_files
+
+
+@app.command(
+    context_settings={
+        "allow_extra_args": True,
+        "ignore_unknown_options": True,
+        "allow_interspersed_args": False,
+    }
+)
+def main(
+    ctx: typer.Context,
+    repo: Path = typer.Option(
+        Path("."),
+        "-C",
+        "--repo",
+        help="Run as if git was started in <path> (like git -C).",
+        exists=True,
+        file_okay=False,
+        dir_okay=True,
+        readable=True,
+        resolve_path=True,
+    ),
+    decorate: List[str] = typer.Option(
+        None,
+        "--decorate",
+        help=(
+            "Repeatable. Comma-separated specs like graph:on:ascii,refs:on:short "
+            "or graph:mode=on:style=box."
+        ),
+        callback=lambda v: v,
+    ),
+    graph: bool = typer.Option(False, "--graph", help="Alias for --decorate graph:on"),
+    tree: bool = typer.Option(False, "--tree", help="Alias for --decorate tree:on"),
+    refs: bool = typer.Option(False, "--refs", help="Alias for --decorate refs:on"),
+    reversed_: bool = typer.Option(False, "--reversed", help="Alias for --decorate reversed:on"),
+) -> None:
+    """
+    Prototype wrapper around `git log` that can render a tree view.
+
+    - Wrapper options must appear before the first positional arg (e.g. before `log`).
+    - Use `--` to separate git-log args from pathspecs (paths). Only args after `--` are treated as pathspecs.
+    """
+    raw: List[str] = decorate or []
+    if graph:
+        raw.append("graph:on")
+    if tree:
+        raw.append("tree:on")
+    if refs:
+        raw.append("refs:on")
+    if reversed_:
+        raw.append("reversed:on")
+
+    specs: List[DecoratorSpec] = []
+    for s in raw:
+        specs.extend(parse_spec_list(s))
+    final = _merge_last_wins(specs)
+
+    # Everything not consumed by Typer is forwarded to git log.
+    git_args = list(ctx.args)
+
+    # Prototype CLI: `git-tree ... log [git-log-args...] [-- pathspecs...]`
+    default_view = "tree"
+    if git_args and git_args[0] == "log":
+        default_view = "dag"
+        git_args = git_args[1:]
+
+        # Prototype log options (must appear after `log`):
+        # - --tree: switch to tree renderer (do NOT forward to git log)
+        if "--tree" in git_args:
+            git_args = [a for a in git_args if a != "--tree"]
+            default_view = "tree"
+            final["tree"] = DecoratorSpec(kind="tree", mode="on")
+
+        # Defensive: Click may leave literal '--' in ctx.args in some edge cases.
+        git_args = [a for a in git_args if a != "--"]
+
+    # Strict pathspecs: only after `--` (Click strips it, so inspect sys.argv)
+    argv = sys.argv[1:]
+    pathspecs: List[str] = []
+    if "--" in argv:
+        sep = argv.index("--")
+        pathspecs = argv[sep + 1 :]
+        if pathspecs and len(git_args) >= len(pathspecs) and git_args[-len(pathspecs) :] == pathspecs:
+            git_args = git_args[: -len(pathspecs)]
+    # Defensive: ensure we don't forward a stray separator to git (prevents `-- -- pathspec`).
+    git_args = [a for a in git_args if a != "--"]
+
+    view, graph_glyphs, tree_style, compact, supercompact, max_files = _apply_decorators(
+        final,
+        git_args=git_args,
+        default_view=default_view,
+    )
+
+    _run(
+        repo=repo,
+        view=view,
+        graph_glyphs=graph_glyphs,
+        tree_style=tree_style,
+        compact=compact,
+        supercompact=supercompact,
+        max_files=max_files,
+        git_args=git_args,
+        pathspecs=pathspecs,
+    )
+
 
 if __name__ == "__main__":
-    main()
+    # Bubble exceptions for normal Python tracebacks (debug-friendly)
+    app(standalone_mode=False)
